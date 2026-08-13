@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# Generated artifacts — all reproducible from the pipeline
+build/*
+!build/.gitkeep
+
+# No CRF PDFs in the repo -- not real ones, and not the synthetic one either.
+# The synthetic CRF is regenerated on demand (scripts/make_sample_crf.py).
+# Only its truth file is tracked: plain coordinates and labels, no form, no
+# study data. Committing it is what stops the generator and extract.py from
+# silently agreeing on the same wrong assumption.
+fixtures/*
+!fixtures/.gitkeep
+!fixtures/sample_crf_truth.json

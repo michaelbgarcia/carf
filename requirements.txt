@@ -1,0 +1,4 @@
+pymupdf            # PDF engine: extraction, geometry, stamping (AGPL-3.0, cleared for this node)
+pydantic>=2        # typed annotation records, validation at the parse boundary
+dash>=2.18         # review UI (later phase)
+dash-ag-grid>=31.2 # review UI (later phase)
