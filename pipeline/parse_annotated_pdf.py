@@ -453,10 +453,62 @@ def write_lookup_csv(mappings: list[RecoveredMapping], out_path: str | Path) -> 
     return out_path
 
 
+# --------------------------------------------------------------------------
+# Full diagnostic export -- every mark, matched or not
+# --------------------------------------------------------------------------
+
+REPORT_COLUMNS = [
+    "page", "kind", "text", "domain", "variable", "condition",
+    "domain_inferred", "field_id", "label", "context", "match_distance",
+]
+
+
+def to_report_rows(mappings: list[RecoveredMapping]) -> list[dict]:
+    """Every recovered mark, one row each, matched or not.
+
+    Unlike :func:`to_lookup_rows` -- which keeps only what's reusable as
+    Copilot-prompt precedent -- this is the full audit view: domain banners,
+    not-submitted notes, and anything that found no field within
+    ``max_match_distance`` all get a row, with ``field_id`` blank wherever a
+    match failed. That blank is the signal to look at: a page-by-page count
+    of it is the actual answer to "how much of this resolved cleanly".
+    """
+    rows = []
+    for m in mappings:
+        rows.append(
+            {
+                "page": m.page_index + 1,
+                "kind": m.kind,
+                "text": m.text,
+                "domain": m.domain or "",
+                "variable": m.variable or "",
+                "condition": m.condition or "",
+                "domain_inferred": m.domain_inferred,
+                "field_id": m.field_id or "",
+                "label": m.label or "",
+                "context": m.context or "",
+                "match_distance": round(m.match_distance, 1) if m.match_distance is not None else "",
+            }
+        )
+    return rows
+
+
+def write_report_csv(mappings: list[RecoveredMapping], out_path: str | Path) -> Path:
+    """Write the full diagnostic CSV -- see :func:`to_report_rows`."""
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=REPORT_COLUMNS)
+        writer.writeheader()
+        writer.writerows(to_report_rows(mappings))
+    return out_path
+
+
 __all__ = [
     "DEFAULT_MAX_MATCH_DISTANCE",
     "LOOKUP_COLUMNS",
     "NOT_SUBMITTED_TEXT",
+    "REPORT_COLUMNS",
     "RawMark",
     "RecoveredMapping",
     "attribute_domains",
@@ -465,5 +517,7 @@ __all__ = [
     "parse_mapping_text",
     "read_marks",
     "to_lookup_rows",
+    "to_report_rows",
     "write_lookup_csv",
+    "write_report_csv",
 ]

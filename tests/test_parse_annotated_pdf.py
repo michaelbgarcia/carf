@@ -25,7 +25,9 @@ from pipeline.parse_annotated_pdf import (
     parse_mapping_text,
     read_marks,
     to_lookup_rows,
+    to_report_rows,
     write_lookup_csv,
+    write_report_csv,
 )
 from pipeline.parse_response import ingest_response_file
 from pipeline.prompt import write_batches
@@ -234,3 +236,41 @@ def test_lookup_csv_round_trips_through_a_file(crfs, annotated_pdf, tmp_path):
     matched_variable = [m for m in mappings if m.kind == "variable" and m.field_id is not None]
     assert len(rows) == len(matched_variable)
     assert rows[0]["label"]  # every matched field has a caption in this fixture
+
+
+# --- full diagnostic report ---------------------------------------------------
+
+
+def test_report_has_one_row_per_mark_including_unmatched(crfs):
+    """Unlike the lookup table, the report keeps a row even when matching fails."""
+    fieldset = extract_fields(crfs["acroform"])
+    from pipeline.parse_annotated_pdf import RecoveredMapping
+
+    unmatched = RecoveredMapping(
+        page_index=0,
+        bbox=BBox(x0=0, y0=0, x1=10, y1=10),
+        text="DM.SEX",
+        kind="variable",
+        domain="DM",
+        variable="SEX",
+    )
+    matched = match_marks_to_fields([unmatched], fieldset, max_distance=5.0)
+    rows = to_report_rows(matched)
+    assert len(rows) == 1
+    assert rows[0]["field_id"] == ""
+    assert rows[0]["domain"] == "DM"
+    assert rows[0]["variable"] == "SEX"
+
+
+def test_report_csv_has_a_row_for_every_recovered_mark(crfs, annotated_pdf, tmp_path):
+    final, placed = annotated_pdf
+    mappings = parse_annotated_pdf(final, crfs["acroform"])
+    out = write_report_csv(mappings, tmp_path / "report.csv")
+
+    import csv as csv_module
+
+    with out.open(encoding="utf-8") as fh:
+        rows = list(csv_module.DictReader(fh))
+    assert len(rows) == len(mappings)
+    # every mark in this fixture matches, so the report should show no gaps
+    assert all(r["field_id"] for r in rows)
