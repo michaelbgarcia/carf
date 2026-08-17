@@ -169,6 +169,15 @@ class CRFField(BaseModel):
     acroform_name: Optional[str] = Field(
         default=None, description="AcroForm /T value when source is acroform"
     )
+    group_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Set when this field is one option in a shared checkbox/radio "
+            "question (e.g. a Yes/No/Not Applicable row) -- fields sharing a "
+            "group_id answer the same question and may be annotated as a "
+            "group rather than individually."
+        ),
+    )
 
 
 class FieldSet(BaseModel):

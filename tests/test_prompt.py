@@ -23,6 +23,7 @@ from pipeline.prompt import (
     SHEET_COLUMNS,
     batch_pages,
     build_batch_instructions,
+    build_precedent_appendix,
     build_spec_sheet,
     write_batches,
 )
@@ -184,6 +185,50 @@ def test_instructions_end_with_the_one_line_reminder(instructions):
 
 def test_instructions_name_their_batch_for_a_human(instructions):
     assert instructions.startswith("CRF annotation batch 1 of 1")
+
+
+# --- historical precedent appendix ---------------------------------------------
+
+
+def test_precedent_rows_default_produces_identical_instructions_to_before(fieldset, one_batch):
+    """No precedent_rows argument (the historical default) must be
+    byte-identical to explicitly passing None -- and must include no trace
+    of a precedent section at all."""
+    baseline = build_batch_instructions(fieldset, one_batch[0], 1, 1)
+    explicit_none = build_batch_instructions(fieldset, one_batch[0], 1, 1, precedent_rows=None)
+    assert baseline == explicit_none
+    assert "HISTORICAL PRECEDENT" not in baseline
+
+
+def test_precedent_appendix_is_empty_with_no_rows(fieldset, one_batch):
+    assert build_precedent_appendix(None, fieldset, one_batch[0]) == ""
+    assert build_precedent_appendix([], fieldset, one_batch[0]) == ""
+
+
+def test_precedent_appendix_only_includes_batch_relevant_rows(fieldset, one_batch):
+    rows = [
+        {
+            "label": "Subject Identifier", "domain": "DM", "variable": "USUBJID",
+            "condition": "", "fixed_value": "", "count": "5",
+        },
+        {
+            "label": "Completely Unrelated Widget", "domain": "ZZ", "variable": "ZZFOO",
+            "condition": "", "fixed_value": "", "count": "5",
+        },
+    ]
+    appendix = build_precedent_appendix(rows, fieldset, one_batch[0])
+    assert "DM.USUBJID" in appendix
+    assert "ZZ.ZZFOO" not in appendix
+
+
+def test_instructions_include_relevant_precedent_when_given(fieldset, one_batch):
+    rows = [{
+        "label": "Subject Identifier", "domain": "DM", "variable": "USUBJID",
+        "condition": "", "fixed_value": "", "count": "5",
+    }]
+    with_precedent = build_batch_instructions(fieldset, one_batch[0], 1, 1, precedent_rows=rows)
+    assert "HISTORICAL PRECEDENT" in with_precedent
+    assert "DM.USUBJID" in with_precedent
 
 
 # --- file output ---------------------------------------------------------------

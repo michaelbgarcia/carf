@@ -47,7 +47,7 @@ import pymupdf
 from pipeline import layout
 from pipeline.extract import extract_fields
 from pipeline.geometry import fitz_rect_to_bbox
-from pipeline.models import BBox, FieldSet
+from pipeline.models import BBox, CRFField, FieldSet
 
 NOT_SUBMITTED_TEXT = "[Not Submitted]"
 DEFAULT_MAX_MATCH_DISTANCE = 200.0  # points; layout.py's own moves are well under this
@@ -58,7 +58,8 @@ _DA_COLOR_RE = re.compile(r"([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+rg")
 _MAPPING_RE = re.compile(
     r"^\s*(?:(?P<domain>[A-Za-z]{2,8})\.(?P<var_with_domain>[A-Za-z0-9_]+)"
     r"|(?P<var_alone>[A-Za-z0-9_]+))"
-    r"(?:\s+when\s+(?P<condition>.+?))?\s*$"
+    r"(?:\s+when\s+(?P<condition>.+?)"
+    r"|\s*=\s*(?P<fixed_value>\"[^\"]*\"|.+?))?\s*$"
 )
 
 
@@ -132,29 +133,90 @@ def read_marks(pdf_path: str | Path) -> list[RawMark]:
         doc.close()
 
 
+_LEGEND_RE = re.compile(r"^\s*(?P<code>[A-Za-z]{2,8})\s*=\s*(?P<name>[A-Za-z][A-Za-z0-9 /&\-]*)\s*$")
+
+
+def split_legend_marks(
+    marks: list[RawMark], fieldset: FieldSet
+) -> tuple[dict[int, dict[str, str]], list[RawMark]]:
+    """Pull page-level domain legends (e.g. ``DS=Disposition``) out of the marks.
+
+    A legend sits in a page's header/margin, above every capture field on
+    that page, and reads as a bare domain code -> full name -- the same
+    ``CODE = phrase`` shape a fixed-value assignment mark can have (e.g.
+    ``DSCAT = PROTOCOL MILESTONE``, see :func:`parse_mapping_text`). Text
+    shape alone cannot tell the two apart; position can, and must: a legend
+    is never handed to ``_mark_to_mapping``/``attribute_domains``/
+    ``match_marks_to_fields`` -- it describes the page, not a field, and
+    parsing it as one would invent a nonsense variable named after the
+    domain's own full name.
+
+    Returns ``({page_index: {code: name}}, marks_with_legends_removed)``. A
+    page with no detected fields yields no legends from it -- nothing to
+    compare a mark's position against, and no fields to make the legend
+    useful to anyway.
+    """
+    field_top: dict[int, float] = {}
+    for f in fieldset.fields:
+        field_top[f.page_index] = max(field_top.get(f.page_index, f.bbox.y1), f.bbox.y1)
+
+    legends: dict[int, dict[str, str]] = {}
+    remaining: list[RawMark] = []
+    for m in marks:
+        top = field_top.get(m.page_index)
+        match = _LEGEND_RE.match(m.text) if top is not None else None
+        if match and m.bbox.y0 >= top:
+            legends.setdefault(m.page_index, {})[match.group("code").upper()] = match.group(
+                "name"
+            ).strip()
+            continue
+        remaining.append(m)
+    return legends, remaining
+
+
 # --------------------------------------------------------------------------
 # Text -> structure
 # --------------------------------------------------------------------------
 
 
-def parse_mapping_text(text: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
+def _strip_quotes(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    value = value.strip()
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        return value[1:-1]
+    return value
+
+
+def parse_mapping_text(
+    text: str,
+) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
     """Inverse of ``SdtmAnnotation.label_text()``/``display_text()`` -- best effort.
 
-    Returns ``(domain, variable, condition)``. A domain banner's own text is
-    just its code with no dot ("VS"), which this regex cannot tell apart from
-    a bare variable ("SEX") -- that disambiguation needs the mark's `boxed`
-    flag, which lives in the caller (:func:`_mark_to_mapping`), not in the
-    text shape alone.
+    Returns ``(domain, variable, condition, fixed_value)``. A domain banner's
+    own text is just its code with no dot ("VS"), which this regex cannot
+    tell apart from a bare variable ("SEX") -- that disambiguation needs the
+    mark's `boxed` flag, which lives in the caller (:func:`_mark_to_mapping`),
+    not in the text shape alone.
+
+    `condition` and `fixed_value` are mutually exclusive and answer different
+    questions: `condition` (introduced by the literal word "when") selects
+    *which row* of a findings-class domain a mapping applies to; `fixed_value`
+    (introduced by "=") asserts what a constant/qualifier variable's value
+    *always is*, e.g. ``DSCAT = PROTOCOL MILESTONE``. Quotes around a fixed
+    value are stripped; case is otherwise preserved, same as `condition`.
     """
     text = text.strip()
     if not text or text == NOT_SUBMITTED_TEXT:
-        return None, None, None
+        return None, None, None, None
     m = _MAPPING_RE.match(text)
     if not m:
-        return None, None, None
+        return None, None, None, None
+    condition = m.group("condition")
+    fixed_value = _strip_quotes(m.group("fixed_value"))
     if m.group("domain"):
-        return m.group("domain").upper(), m.group("var_with_domain").upper(), m.group("condition")
-    return None, m.group("var_alone").upper(), m.group("condition")
+        return m.group("domain").upper(), m.group("var_with_domain").upper(), condition, fixed_value
+    return None, m.group("var_alone").upper(), condition, fixed_value
 
 
 # --------------------------------------------------------------------------
@@ -180,11 +242,16 @@ class RecoveredMapping:
     domain: Optional[str] = None
     variable: Optional[str] = None
     condition: Optional[str] = None
+    fixed_value: Optional[str] = None  # e.g. "PROTOCOL MILESTONE" from "DSCAT = PROTOCOL MILESTONE"
     domain_inferred: bool = False  # True if `domain` came from a nearby banner, not this mark's own text
+    domain_inference_source: Optional[str] = None  # "banner" | "builtin" | "precedent"
     field_id: Optional[str] = None
     label: Optional[str] = None
     context: Optional[str] = None
     match_distance: Optional[float] = None  # points, centre-to-centre; None if unmatched
+    synthesized: bool = False  # True only for summarize_page_domains' derived page-domain rows
+    legend_name: Optional[str] = None  # cross-check: this domain's name in the page's own legend, if any
+    source_pdf: Optional[str] = None  # filename, set by pipeline.corpus_precedent when mining a corpus
 
 
 def _center(bbox: BBox) -> tuple[float, float]:
@@ -198,7 +265,7 @@ def _distance(a: BBox, b: BBox) -> float:
 
 
 def _mark_to_mapping(mark: RawMark) -> RecoveredMapping:
-    domain, variable, condition = parse_mapping_text(mark.text)
+    domain, variable, condition, fixed_value = parse_mapping_text(mark.text)
     if mark.boxed:
         # A banner's text is its domain code alone -- what the regex above,
         # lacking a dot to key on, puts in `variable` for lack of anywhere
@@ -217,6 +284,7 @@ def _mark_to_mapping(mark: RawMark) -> RecoveredMapping:
         domain=domain,
         variable=variable,
         condition=condition,
+        fixed_value=fixed_value,
     )
 
 
@@ -224,14 +292,69 @@ def _mark_to_mapping(mark: RawMark) -> RecoveredMapping:
 # Domain banner attribution
 # --------------------------------------------------------------------------
 
+# CDISC SDTMIG-standardized variables whose home domain isn't guessable from
+# the variable's own name (RFICDTC lives on DM, not "RF"). These are facts
+# about the standard, not study-specific guesses, so they belong in code
+# rather than in mined corpus data -- the weakest, mined "precedent" tier
+# below is for everything this table doesn't cover.
+BUILTIN_DOMAIN_PRECEDENT: dict[str, str] = {
+    "RFICDTC": "DM",
+    "RFSTDTC": "DM",
+    "RFENDTC": "DM",
+    "RFXSTDTC": "DM",
+    "RFXENDTC": "DM",
+    "RFPENDTC": "DM",
+    "DTHDTC": "DM",
+    "SUBJID": "DM",
+    "USUBJID": "DM",
+}
 
-def attribute_domains(mappings: list[RecoveredMapping]) -> list[RecoveredMapping]:
-    """Fill in `domain` on a variable mark from the nearest banner above it.
+# Two-letter SDTM domain codes recognised as a variable-name prefix (e.g.
+# DSSTDTC -> DS) -- the general SDTMIG convention, not an exhaustive list.
+_KNOWN_DOMAIN_PREFIXES = {
+    "DM", "DS", "AE", "CM", "VS", "LB", "EG", "MH", "PE", "SU", "EX", "CE",
+    "DV", "IE", "DA", "FA", "MB", "MI", "RS", "SC", "SS", "TU", "TR", "QS",
+}
 
-    Mirrors ``extract.py``'s ``_section_heading``: a domain banner governs
-    everything below it on the page, so proximity here is vertical-only, not
-    bounded by horizontal overlap the way caption lookup is -- a banner is
-    usually left-aligned while the fields under it are indented.
+
+def _builtin_domain(variable: Optional[str]) -> Optional[str]:
+    """CDISC-standardized domain fallback -- not a mined guess.
+
+    Tries the explicit table first (for variables like RFICDTC where the
+    domain isn't in the variable's own name), then the general SDTMIG
+    convention that a domain-prefixed variable name's first two letters name
+    its own domain.
+    """
+    if not variable:
+        return None
+    if variable in BUILTIN_DOMAIN_PRECEDENT:
+        return BUILTIN_DOMAIN_PRECEDENT[variable]
+    prefix = variable[:2]
+    if prefix in _KNOWN_DOMAIN_PREFIXES and variable != prefix:
+        return prefix
+    return None
+
+
+def attribute_domains(
+    mappings: list[RecoveredMapping], precedent: dict[str, str] | None = None
+) -> list[RecoveredMapping]:
+    """Fill in `domain` on a variable mark, weakest evidence last.
+
+    Four tiers, in order: the mark's own explicit domain (nothing to do);
+    the nearest boxed banner above it on the page (mirrors ``extract.py``'s
+    ``_section_heading`` -- a domain banner governs everything below it,
+    proximity is vertical-only, not bounded by horizontal overlap the way
+    caption lookup is, since a banner is usually left-aligned while the
+    fields under it are indented); CDISC-standardized built-in constants
+    (:func:`_builtin_domain`); and finally ``precedent`` -- a variable ->
+    domain table mined from a historical corpus (see
+    ``pipeline/corpus_precedent.py``), the weakest tier since it reflects
+    what other documents did, not what this one says.
+
+    ``domain_inference_source`` records which tier fired ("banner" |
+    "builtin" | "precedent"), so a caller mining this output as further
+    precedent can require the strongest evidence and avoid amplifying its
+    own guesses (see ``build_variable_domain_precedent``).
     """
     banners_by_page: dict[int, list[RecoveredMapping]] = {}
     for m in mappings:
@@ -243,6 +366,7 @@ def attribute_domains(mappings: list[RecoveredMapping]) -> list[RecoveredMapping
         if m.kind != "variable" or m.domain:
             out.append(m)
             continue
+
         best: Optional[tuple[float, RecoveredMapping]] = None
         for b in banners_by_page.get(m.page_index, []):
             if b.bbox.y0 < m.bbox.y1:  # banner must sit at or above the mark
@@ -250,7 +374,29 @@ def attribute_domains(mappings: list[RecoveredMapping]) -> list[RecoveredMapping
             d = b.bbox.y0 - m.bbox.y1
             if best is None or d < best[0]:
                 best = (d, b)
-        out.append(replace(m, domain=best[1].domain, domain_inferred=True) if best else m)
+        if best is not None:
+            out.append(
+                replace(
+                    m, domain=best[1].domain, domain_inferred=True, domain_inference_source="banner"
+                )
+            )
+            continue
+
+        builtin = _builtin_domain(m.variable)
+        if builtin is not None:
+            out.append(
+                replace(m, domain=builtin, domain_inferred=True, domain_inference_source="builtin")
+            )
+            continue
+
+        mined = precedent.get(m.variable) if precedent and m.variable else None
+        if mined is not None:
+            out.append(
+                replace(m, domain=mined, domain_inferred=True, domain_inference_source="precedent")
+            )
+            continue
+
+        out.append(m)
     return out
 
 
@@ -301,15 +447,58 @@ def _reverse_layout_score(mark_bbox: BBox, field_bbox: BBox) -> Optional[float]:
     return None
 
 
+def _group_candidate_fields(fieldset: FieldSet) -> list[CRFField]:
+    """One synthetic field per ``group_id``, spanning its members' union bbox.
+
+    A mark describing a whole checkbox question (e.g. a Yes/No/Not Applicable
+    row) is drawn once beside the row, not beside any one option -- so it
+    naturally sits closer to the group's union bbox than to any single
+    option's small bbox off to one side. Adding these into the same
+    candidate pool :func:`match_marks_to_fields` scores against needs no
+    change to the matching algorithm itself; the union bbox just competes on
+    ordinary centroid distance like any other field. ``field_id`` carries a
+    ``grp_`` prefix -- the only signal a recovered mapping matched a group
+    rather than an individual option. Fields with no ``group_id`` (any
+    ``FieldSet`` predating this, or a page with no checkbox groups) produce
+    no candidates here, so this is a no-op unless grouping was detected.
+    """
+    members: dict[tuple[int, str], list[CRFField]] = {}
+    for f in fieldset.fields:
+        if f.group_id:
+            members.setdefault((f.page_index, f.group_id), []).append(f)
+
+    groups: list[CRFField] = []
+    for (page_index, group_id), fields in members.items():
+        groups.append(
+            CRFField(
+                field_id=f"grp_{group_id}",
+                page_index=page_index,
+                bbox=BBox(
+                    x0=min(f.bbox.x0 for f in fields),
+                    y0=min(f.bbox.y0 for f in fields),
+                    x1=max(f.bbox.x1 for f in fields),
+                    y1=max(f.bbox.y1 for f in fields),
+                ),
+                label=" / ".join(dict.fromkeys(f.label for f in fields if f.label)),
+                source=fields[0].source,
+                context=fields[0].context,
+                group_id=group_id,
+            )
+        )
+    return groups
+
+
 def match_marks_to_fields(
     mappings: list[RecoveredMapping],
     fieldset: FieldSet,
     max_distance: float = DEFAULT_MAX_MATCH_DISTANCE,
 ) -> list[RecoveredMapping]:
-    """Re-attach each variable/note mark to the field it most likely annotates.
+    """Re-attach each variable/note mark to the field(s) it most likely annotates.
 
     A domain banner covers a whole section, not one field, so it is never
-    matched. Two tiers, per (mark, field) candidate pair on the same page:
+    matched. Candidate fields are every ``CRFField`` on the page plus one
+    synthetic candidate per checkbox group (:func:`_group_candidate_fields`).
+    Two tiers, per (mark, field) candidate pair on the same page:
 
     1. **Exact reverse-layout alignment** (:func:`_reverse_layout_score`) --
        reconstructs ``layout.place_one``'s own placement math and asks "is
@@ -324,11 +513,23 @@ def match_marks_to_fields(
        Acrobat. Ranked behind every tier-1 match via ``_CENTROID_OFFSET`` so
        an exact reconstruction is always preferred when one exists.
 
-    Either way, matching is greedy: candidates are taken lowest-score first,
-    each field and each mark retired once used.
+    Each mark keeps only its own single lowest-rank candidate. A field is
+    *not* retired once matched: one CRF field legitimately maps to more than
+    one SDTM variable (e.g. a single collected date populating both
+    ``DM.RFICDTC`` and ``DS.DSSTDTC``), so a field can end up matched by 0, 1,
+    or several marks. This is safe for tier-1 alignment, which is collision-
+    safe by construction -- two distinct fields cannot both satisfy
+    ``_reverse_layout_score`` against the same mark bbox, since that would
+    require identical field geometry. It is *not* defended for a tier-2-only
+    collision between two distinct, nearby fields with no exact alignment
+    evidence for either mark (a third-party aCRF never positioned by
+    ``layout.py``) -- resolving that would require comparing mark *text*,
+    which is not this function's job. ``match_distance`` makes a bad tier-2
+    guess visible to whoever reviews the report.
     """
+    all_fields = list(fieldset.fields) + _group_candidate_fields(fieldset)
     fields_by_page: dict[int, list] = {}
-    for f in fieldset.fields:
+    for f in all_fields:
         fields_by_page.setdefault(f.page_index, []).append(f)
 
     # (rank, mark_index, field_id, reported_distance) -- `rank` decides match
@@ -349,14 +550,12 @@ def match_marks_to_fields(
     candidates.sort(key=lambda t: t[0])
 
     chosen: dict[int, tuple[str, float]] = {}
-    used_fields: set[str] = set()
     for _rank, i, field_id, d in candidates:
-        if i in chosen or field_id in used_fields:
+        if i in chosen:
             continue
         chosen[i] = (field_id, d)
-        used_fields.add(field_id)
 
-    fields_by_id = {f.field_id: f for f in fieldset.fields}
+    fields_by_id = {f.field_id: f for f in all_fields}
     out: list[RecoveredMapping] = []
     for i, m in enumerate(mappings):
         if i not in chosen:
@@ -377,6 +576,55 @@ def match_marks_to_fields(
 
 
 # --------------------------------------------------------------------------
+# Page-level domain summary
+# --------------------------------------------------------------------------
+
+
+def summarize_page_domains(
+    mappings: list[RecoveredMapping], legend_by_page: dict[int, dict[str, str]] | None = None
+) -> list[RecoveredMapping]:
+    """Append one derived "domain present" row per (page, domain).
+
+    Must run *last*, after :func:`attribute_domains` and
+    :func:`match_marks_to_fields`, so it reflects each mark's final resolved
+    domain rather than raw annotation text -- this is what makes it a
+    summary *derived from* what was actually found on the page, not a
+    re-parsing of the page's own legend (see :func:`split_legend_marks`).
+    Field-matching success is irrelevant here: a mark still establishes "this
+    domain is present on this page" whether or not a field was found for it.
+
+    Reuses the existing ``kind="domain"`` value rather than inventing a new
+    one, so a synthesized row is automatically excluded from
+    :func:`to_lookup_rows` and would be excluded from ever re-entering
+    ``attribute_domains``/``match_marks_to_fields`` if this output were
+    accidentally re-run through them. ``legend_name`` is populated only when
+    the page's own legend also named that domain code -- a cross-check for a
+    reviewer, never the source of the domain itself.
+    """
+    legend_by_page = legend_by_page or {}
+    representative: dict[tuple[int, str], RecoveredMapping] = {}
+    for m in mappings:
+        if m.kind != "variable" or not m.domain:
+            continue
+        key = (m.page_index, m.domain)
+        representative.setdefault(key, m)
+
+    summaries = [
+        RecoveredMapping(
+            page_index=page_index,
+            bbox=rep.bbox,
+            text=domain,
+            kind="domain",
+            domain=domain,
+            synthesized=True,
+            legend_name=legend_by_page.get(page_index, {}).get(domain),
+        )
+        for (page_index, domain), rep in sorted(representative.items())
+    ]
+    return mappings + summaries
+
+
+# --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
 
@@ -385,6 +633,7 @@ def parse_annotated_pdf(
     pdf_path: str | Path,
     blank_pdf_path: str | Path | None = None,
     max_match_distance: float = DEFAULT_MAX_MATCH_DISTANCE,
+    precedent: dict[str, str] | None = None,
 ) -> list[RecoveredMapping]:
     """An already-annotated CRF -> best-effort recovered mappings.
 
@@ -394,12 +643,19 @@ def parse_annotated_pdf(
     works as long as the annotations were never flattened into page content
     (this pipeline never flattens; see ``render.save_with_annotations`` --
     but a third-party aCRF is not guaranteed to make the same choice).
+
+    Pass ``precedent`` (a variable -> domain table, typically from
+    ``pipeline.corpus_precedent.build_variable_domain_precedent``) to give
+    ``attribute_domains`` a fourth, weakest fallback tier for variables a
+    boxed banner and the built-in CDISC constants both leave unattributed.
     """
     marks = read_marks(pdf_path)
     fieldset = extract_fields(blank_pdf_path or pdf_path)
+    legend_by_page, marks = split_legend_marks(marks, fieldset)
     mappings = [_mark_to_mapping(m) for m in marks]
-    mappings = attribute_domains(mappings)
+    mappings = attribute_domains(mappings, precedent)
     mappings = match_marks_to_fields(mappings, fieldset, max_match_distance)
+    mappings = summarize_page_domains(mappings, legend_by_page)
     return mappings
 
 
@@ -408,7 +664,7 @@ def parse_annotated_pdf(
 # --------------------------------------------------------------------------
 
 LOOKUP_COLUMNS = [
-    "page", "label", "context", "domain", "variable", "condition",
+    "page", "label", "context", "domain", "variable", "condition", "fixed_value",
     "domain_inferred", "match_distance", "text",
 ]
 
@@ -434,6 +690,7 @@ def to_lookup_rows(mappings: list[RecoveredMapping]) -> list[dict]:
                 "domain": m.domain or "",
                 "variable": m.variable or "",
                 "condition": m.condition or "",
+                "fixed_value": m.fixed_value or "",
                 "domain_inferred": m.domain_inferred,
                 "match_distance": round(m.match_distance, 1) if m.match_distance is not None else "",
                 "text": m.text,
@@ -458,8 +715,9 @@ def write_lookup_csv(mappings: list[RecoveredMapping], out_path: str | Path) -> 
 # --------------------------------------------------------------------------
 
 REPORT_COLUMNS = [
-    "page", "kind", "text", "domain", "variable", "condition",
-    "domain_inferred", "field_id", "label", "context", "match_distance",
+    "page", "kind", "text", "domain", "variable", "condition", "fixed_value",
+    "domain_inferred", "domain_inference_source", "field_id", "label", "context",
+    "match_distance", "synthesized", "legend_name",
 ]
 
 
@@ -483,11 +741,15 @@ def to_report_rows(mappings: list[RecoveredMapping]) -> list[dict]:
                 "domain": m.domain or "",
                 "variable": m.variable or "",
                 "condition": m.condition or "",
+                "fixed_value": m.fixed_value or "",
                 "domain_inferred": m.domain_inferred,
+                "domain_inference_source": m.domain_inference_source or "",
                 "field_id": m.field_id or "",
                 "label": m.label or "",
                 "context": m.context or "",
                 "match_distance": round(m.match_distance, 1) if m.match_distance is not None else "",
+                "synthesized": m.synthesized,
+                "legend_name": m.legend_name or "",
             }
         )
     return rows
@@ -505,6 +767,7 @@ def write_report_csv(mappings: list[RecoveredMapping], out_path: str | Path) -> 
 
 
 __all__ = [
+    "BUILTIN_DOMAIN_PRECEDENT",
     "DEFAULT_MAX_MATCH_DISTANCE",
     "LOOKUP_COLUMNS",
     "NOT_SUBMITTED_TEXT",
@@ -516,6 +779,8 @@ __all__ = [
     "parse_annotated_pdf",
     "parse_mapping_text",
     "read_marks",
+    "split_legend_marks",
+    "summarize_page_domains",
     "to_lookup_rows",
     "to_report_rows",
     "write_lookup_csv",

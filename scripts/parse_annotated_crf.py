@@ -39,6 +39,31 @@ from pipeline.parse_annotated_pdf import (  # noqa: E402
 )
 
 
+def _load_precedent(path: Path) -> dict[str, str]:
+    """Corpus lookup CSV (from scripts/mine_corpus.py) -> variable -> domain table.
+
+    Majority-vote per variable, weighted by each row's ``count`` column --
+    the same evidence ``mine_corpus`` already vetted (see
+    ``pipeline.corpus_precedent.build_variable_domain_precedent``), just
+    re-read back from the CSV rather than re-derived from raw mappings.
+    """
+    import csv as csv_module
+    from collections import Counter, defaultdict
+
+    votes: dict[str, Counter] = defaultdict(Counter)
+    with path.open(encoding="utf-8") as fh:
+        for row in csv_module.DictReader(fh):
+            variable, domain = row.get("variable"), row.get("domain")
+            if not variable or not domain:
+                continue
+            try:
+                weight = int(row.get("count") or 1)
+            except ValueError:
+                weight = 1
+            votes[variable][domain] += weight
+    return {variable: counter.most_common(1)[0][0] for variable, counter in votes.items()}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("pdf", type=Path, help="already-annotated CRF PDF")
@@ -52,9 +77,14 @@ def main(argv: list[str] | None = None) -> int:
         "--lookup-out", type=Path, default=None,
         help="also write the narrower label-keyed reference table here as CSV",
     )
+    parser.add_argument(
+        "--precedent-csv", type=Path, default=None,
+        help="corpus lookup table from scripts/mine_corpus.py, used as a domain-attribution fallback",
+    )
     args = parser.parse_args(argv)
 
-    mappings = parse_annotated_pdf(args.pdf, args.blank, args.max_distance)
+    precedent = _load_precedent(args.precedent_csv) if args.precedent_csv else None
+    mappings = parse_annotated_pdf(args.pdf, args.blank, args.max_distance, precedent)
 
     by_kind: dict[str, int] = {}
     for m in mappings:
@@ -69,7 +99,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"matched to a field: {len(matched)}")
     print(f"unmatched (no field within {args.max_distance:.0f}pt): {len(unmatched)}")
     if inferred:
-        print(f"domain inferred from a nearby banner: {len(inferred)}")
+        by_source: dict[str, int] = {}
+        for m in inferred:
+            source = m.domain_inference_source or "unknown"
+            by_source[source] = by_source.get(source, 0) + 1
+        print(f"domain inferred (not stated on the mark itself): {len(inferred)}")
+        for source, count in sorted(by_source.items()):
+            print(f"  via {source}: {count}")
     if unmatched:
         print("\nunmatched marks:")
         for m in unmatched:

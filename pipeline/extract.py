@@ -207,6 +207,49 @@ def associate_label(
     return None
 
 
+def _checkbox_group_ids(
+    items: list[tuple[str, pymupdf.Rect, bool]], runs: list[TextRun], page_index: int
+) -> dict[str, str]:
+    """Map field_id -> group_id for checkboxes answering one shared question.
+
+    A checkbox's own caption is found to its *right* by ``associate_label``
+    (e.g. "Male") -- which is also what breaks a naive per-checkbox
+    "nearest left-hand text" lookup for a horizontal row of options: every
+    member after the first has *another option's own caption* immediately to
+    its left ("Female"'s nearest left-hand text is "Male", not "Sex:"), not
+    the shared stem. So checkboxes are first clustered into rows by mutual
+    vertical overlap -- the same test ``extract.text_runs`` uses to decide
+    two words share a line -- and the stem lookup runs once per row, against
+    its *leftmost* member only, which has nothing but the real stem to its
+    left.
+
+    A row of one checkbox is not a group -- nothing to disambiguate a lone
+    option from.
+    """
+    checkboxes = [(field_id, rect) for field_id, rect, is_checkbox in items if is_checkbox]
+
+    rows: list[list[tuple[str, pymupdf.Rect]]] = []
+    for field_id, rect in sorted(checkboxes, key=lambda t: (t[1].y0, t[1].x0)):
+        for row in rows:
+            if _v_overlap(row[0][1], rect) >= MIN_V_OVERLAP:
+                row.append((field_id, rect))
+                break
+        else:
+            rows.append([(field_id, rect)])
+
+    group_ids: dict[str, str] = {}
+    for i, row in enumerate(rows, start=1):
+        if len(row) < 2:
+            continue
+        leftmost = min(row, key=lambda t: t[1].x0)[1]
+        if _nearest_left(runs, leftmost) is None:
+            continue
+        gid = f"grp_p{page_index + 1}_{i:02d}"
+        for field_id, _rect in row:
+            group_ids[field_id] = gid
+    return group_ids
+
+
 def _section_heading(headings: Iterable[TextRun], rect: pymupdf.Rect) -> Optional[TextRun]:
     """Nearest heading above the field, at any horizontal position.
 
@@ -298,21 +341,30 @@ def extract_acroform_fields(page: pymupdf.Page, page_index: int) -> list[CRFFiel
     runs = text_runs(page)
     headings = _headings(runs)
     height = page.rect.height
-    out: list[CRFField] = []
 
-    for w in widgets:
-        rect = pymupdf.Rect(w.rect)
-        is_checkbox = w.field_type in _CHECKBOX_WIDGETS
+    items = [
+        (
+            w.field_name or f"p{page_index + 1}_widget{i + 1:03d}",
+            pymupdf.Rect(w.rect),
+            w.field_type in _CHECKBOX_WIDGETS,
+        )
+        for i, w in enumerate(widgets)
+    ]
+    group_ids = _checkbox_group_ids(items, runs, page_index)
+
+    out: list[CRFField] = []
+    for w, (field_id, rect, is_checkbox) in zip(widgets, items):
         label = associate_label(runs, rect, is_checkbox)
         out.append(
             CRFField(
-                field_id=w.field_name or f"p{page_index + 1}_widget{len(out) + 1:03d}",
+                field_id=field_id,
                 page_index=page_index,
                 bbox=fitz_rect_to_bbox(rect, height),
                 label=clean_label(label.text) if label else "",
                 source=FieldSource.ACROFORM,
                 context=build_context(runs, headings, rect),
                 acroform_name=w.field_name,
+                group_id=group_ids.get(field_id),
             )
         )
     return out
@@ -389,8 +441,8 @@ def extract_layout_fields(page: pymupdf.Page, page_index: int) -> list[CRFField]
     headings = _headings(runs)
     height = page.rect.height
 
-    out: list[CRFField] = []
     shapes = sorted(_shapes(page), key=lambda s: (s.rect.y0, s.rect.x0))
+    kept: list[tuple[pymupdf.Rect, bool, Optional[TextRun]]] = []
     for shape in shapes:
         label = associate_label(runs, shape.rect, shape.is_checkbox)
         # An uncaptioned line is a rule, not a blank -- the width test above
@@ -404,15 +456,26 @@ def extract_layout_fields(page: pymupdf.Page, page_index: int) -> list[CRFField]
                 INFERRED_HEIGHT_RANGE[1],
             )
             rect = pymupdf.Rect(rect.x0, rect.y1 - inferred_h, rect.x1, rect.y1)
+        kept.append((rect, shape.is_checkbox, label))
+
+    items = [
+        (f"p{page_index + 1}_{i + 1:03d}", rect, is_checkbox)
+        for i, (rect, is_checkbox, _label) in enumerate(kept)
+    ]
+    group_ids = _checkbox_group_ids(items, runs, page_index)
+
+    out: list[CRFField] = []
+    for (field_id, rect, _is_checkbox), (_rect, _is_checkbox2, label) in zip(items, kept):
         out.append(
             CRFField(
-                field_id=f"p{page_index + 1}_{len(out) + 1:03d}",
+                field_id=field_id,
                 page_index=page_index,
                 bbox=fitz_rect_to_bbox(rect, height),
                 label=clean_label(label.text) if label else "",
                 source=FieldSource.TEXT_LAYOUT,
                 context=build_context(runs, headings, rect),
                 acroform_name=None,
+                group_id=group_ids.get(field_id),
             )
         )
     return out

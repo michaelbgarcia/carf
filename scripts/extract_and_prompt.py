@@ -33,6 +33,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from pipeline import extract, prompt  # noqa: E402
+from pipeline.corpus_precedent import read_corpus_lookup_csv  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -49,6 +50,13 @@ def main(argv: list[str] | None = None) -> int:
             "attachment/context limit is known)"
         ),
     )
+    parser.add_argument(
+        "--precedent-csv", type=Path, default=None,
+        help=(
+            "corpus lookup table from scripts/mine_corpus.py -- included in each "
+            "batch's instructions as historical precedent, filtered to that batch's fields"
+        ),
+    )
     args = parser.parse_args(argv)
 
     args.build_dir.mkdir(parents=True, exist_ok=True)
@@ -59,8 +67,12 @@ def main(argv: list[str] | None = None) -> int:
     fields_json.write_text(fieldset.model_dump_json(indent=2), encoding="utf-8")
     print(f"wrote {fields_json} ({len(fieldset.fields)} fields)")
 
+    precedent_rows = read_corpus_lookup_csv(args.precedent_csv) if args.precedent_csv else None
     manifest = prompt.write_batches(
-        fieldset, args.build_dir, max_fields_per_batch=args.max_fields_per_batch
+        fieldset,
+        args.build_dir,
+        max_fields_per_batch=args.max_fields_per_batch,
+        precedent_rows=precedent_rows,
     )
     manifest_path = args.build_dir / "batches.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")

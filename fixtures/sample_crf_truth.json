@@ -27,7 +27,8 @@
       "label": "Site ID",
       "source": "acroform",
       "context": "Demographics; page header",
-      "acroform_name": "DM_SITEID"
+      "acroform_name": "DM_SITEID",
+      "group_id": null
     },
     {
       "field_id": "DM_USUBJID",
@@ -41,7 +42,8 @@
       "label": "Subject Identifier",
       "source": "acroform",
       "context": "Demographics",
-      "acroform_name": "DM_USUBJID"
+      "acroform_name": "DM_USUBJID",
+      "group_id": null
     },
     {
       "field_id": "DM_BRTHDTC_DD",
@@ -55,7 +57,8 @@
       "label": "Date of Birth (DD/MMM/YYYY)",
       "source": "acroform",
       "context": "Demographics; day component",
-      "acroform_name": "DM_BRTHDTC_DD"
+      "acroform_name": "DM_BRTHDTC_DD",
+      "group_id": null
     },
     {
       "field_id": "DM_BRTHDTC_MMM",
@@ -69,7 +72,8 @@
       "label": "Date of Birth (DD/MMM/YYYY)",
       "source": "acroform",
       "context": "Demographics; month component",
-      "acroform_name": "DM_BRTHDTC_MMM"
+      "acroform_name": "DM_BRTHDTC_MMM",
+      "group_id": null
     },
     {
       "field_id": "DM_BRTHDTC_YYYY",
@@ -83,7 +87,8 @@
       "label": "Date of Birth (DD/MMM/YYYY)",
       "source": "acroform",
       "context": "Demographics; year component",
-      "acroform_name": "DM_BRTHDTC_YYYY"
+      "acroform_name": "DM_BRTHDTC_YYYY",
+      "group_id": null
     },
     {
       "field_id": "DM_AGE",
@@ -97,7 +102,8 @@
       "label": "Age at Consent",
       "source": "acroform",
       "context": "Demographics; units printed as 'years'",
-      "acroform_name": "DM_AGE"
+      "acroform_name": "DM_AGE",
+      "group_id": null
     },
     {
       "field_id": "DM_SEX_M",
@@ -111,7 +117,8 @@
       "label": "Male",
       "source": "acroform",
       "context": "Demographics; Sex",
-      "acroform_name": "DM_SEX_M"
+      "acroform_name": "DM_SEX_M",
+      "group_id": null
     },
     {
       "field_id": "DM_SEX_F",
@@ -125,7 +132,8 @@
       "label": "Female",
       "source": "acroform",
       "context": "Demographics; Sex",
-      "acroform_name": "DM_SEX_F"
+      "acroform_name": "DM_SEX_F",
+      "group_id": null
     },
     {
       "field_id": "DM_RACE_WHITE",
@@ -139,7 +147,8 @@
       "label": "White",
       "source": "acroform",
       "context": "Demographics; Race",
-      "acroform_name": "DM_RACE_WHITE"
+      "acroform_name": "DM_RACE_WHITE",
+      "group_id": null
     },
     {
       "field_id": "DM_RACE_BLACK",
@@ -153,7 +162,8 @@
       "label": "Black or African American",
       "source": "acroform",
       "context": "Demographics; Race",
-      "acroform_name": "DM_RACE_BLACK"
+      "acroform_name": "DM_RACE_BLACK",
+      "group_id": null
     },
     {
       "field_id": "DM_RACE_ASIAN",
@@ -167,7 +177,8 @@
       "label": "Asian",
       "source": "acroform",
       "context": "Demographics; Race",
-      "acroform_name": "DM_RACE_ASIAN"
+      "acroform_name": "DM_RACE_ASIAN",
+      "group_id": null
     },
     {
       "field_id": "DM_RACE_AIAN",
@@ -181,7 +192,8 @@
       "label": "American Indian or Alaska Native",
       "source": "acroform",
       "context": "Demographics; Race",
-      "acroform_name": "DM_RACE_AIAN"
+      "acroform_name": "DM_RACE_AIAN",
+      "group_id": null
     },
     {
       "field_id": "DM_ETHNIC_HL",
@@ -195,7 +207,8 @@
       "label": "Hispanic or Latino",
       "source": "acroform",
       "context": "Demographics; Ethnicity",
-      "acroform_name": "DM_ETHNIC_HL"
+      "acroform_name": "DM_ETHNIC_HL",
+      "group_id": null
     },
     {
       "field_id": "DM_ETHNIC_NHL",
@@ -209,7 +222,8 @@
       "label": "Not Hispanic or Latino",
       "source": "acroform",
       "context": "Demographics; Ethnicity",
-      "acroform_name": "DM_ETHNIC_NHL"
+      "acroform_name": "DM_ETHNIC_NHL",
+      "group_id": null
     },
     {
       "field_id": "DM_COUNTRY",
@@ -223,7 +237,8 @@
       "label": "Country of Enrollment",
       "source": "acroform",
       "context": "Demographics",
-      "acroform_name": "DM_COUNTRY"
+      "acroform_name": "DM_COUNTRY",
+      "group_id": null
     },
     {
       "field_id": "DM_INVINIT",
@@ -237,7 +252,8 @@
       "label": "Investigator Initials",
       "source": "acroform",
       "context": "Demographics; page footer",
-      "acroform_name": "DM_INVINIT"
+      "acroform_name": "DM_INVINIT",
+      "group_id": null
     },
     {
       "field_id": "VS_VISITDAT",
@@ -251,7 +267,8 @@
       "label": "Visit Date",
       "source": "acroform",
       "context": "Vital Signs; page header",
-      "acroform_name": "VS_VISITDAT"
+      "acroform_name": "VS_VISITDAT",
+      "group_id": null
     },
     {
       "field_id": "VS_SYSBP_RES",
@@ -265,7 +282,8 @@
       "label": "Systolic Blood Pressure",
       "source": "acroform",
       "context": "Vital Signs; row 'Systolic Blood Pressure' (mmHg); grid column 'Result'",
-      "acroform_name": "VS_SYSBP_RES"
+      "acroform_name": "VS_SYSBP_RES",
+      "group_id": null
     },
     {
       "field_id": "VS_SYSBP_ND",
@@ -279,7 +297,8 @@
       "label": "Not Done",
       "source": "acroform",
       "context": "Vital Signs; row 'Systolic Blood Pressure'; grid column 'Not Done'",
-      "acroform_name": "VS_SYSBP_ND"
+      "acroform_name": "VS_SYSBP_ND",
+      "group_id": null
     },
     {
       "field_id": "VS_DIABP_RES",
@@ -293,7 +312,8 @@
       "label": "Diastolic Blood Pressure",
       "source": "acroform",
       "context": "Vital Signs; row 'Diastolic Blood Pressure' (mmHg); grid column 'Result'",
-      "acroform_name": "VS_DIABP_RES"
+      "acroform_name": "VS_DIABP_RES",
+      "group_id": null
     },
     {
       "field_id": "VS_DIABP_ND",
@@ -307,7 +327,8 @@
       "label": "Not Done",
       "source": "acroform",
       "context": "Vital Signs; row 'Diastolic Blood Pressure'; grid column 'Not Done'",
-      "acroform_name": "VS_DIABP_ND"
+      "acroform_name": "VS_DIABP_ND",
+      "group_id": null
     },
     {
       "field_id": "VS_PULSE_RES",
@@ -321,7 +342,8 @@
       "label": "Pulse Rate",
       "source": "acroform",
       "context": "Vital Signs; row 'Pulse Rate' (beats/min); grid column 'Result'",
-      "acroform_name": "VS_PULSE_RES"
+      "acroform_name": "VS_PULSE_RES",
+      "group_id": null
     },
     {
       "field_id": "VS_PULSE_ND",
@@ -335,7 +357,8 @@
       "label": "Not Done",
       "source": "acroform",
       "context": "Vital Signs; row 'Pulse Rate'; grid column 'Not Done'",
-      "acroform_name": "VS_PULSE_ND"
+      "acroform_name": "VS_PULSE_ND",
+      "group_id": null
     },
     {
       "field_id": "VS_TEMP_RES",
@@ -349,7 +372,8 @@
       "label": "Body Temperature",
       "source": "acroform",
       "context": "Vital Signs; row 'Body Temperature' (C); grid column 'Result'",
-      "acroform_name": "VS_TEMP_RES"
+      "acroform_name": "VS_TEMP_RES",
+      "group_id": null
     },
     {
       "field_id": "VS_TEMP_ND",
@@ -363,7 +387,8 @@
       "label": "Not Done",
       "source": "acroform",
       "context": "Vital Signs; row 'Body Temperature'; grid column 'Not Done'",
-      "acroform_name": "VS_TEMP_ND"
+      "acroform_name": "VS_TEMP_ND",
+      "group_id": null
     },
     {
       "field_id": "VS_RESP_RES",
@@ -377,7 +402,8 @@
       "label": "Respiratory Rate",
       "source": "acroform",
       "context": "Vital Signs; row 'Respiratory Rate' (breaths/min); grid column 'Result'",
-      "acroform_name": "VS_RESP_RES"
+      "acroform_name": "VS_RESP_RES",
+      "group_id": null
     },
     {
       "field_id": "VS_RESP_ND",
@@ -391,7 +417,8 @@
       "label": "Not Done",
       "source": "acroform",
       "context": "Vital Signs; row 'Respiratory Rate'; grid column 'Not Done'",
-      "acroform_name": "VS_RESP_ND"
+      "acroform_name": "VS_RESP_ND",
+      "group_id": null
     },
     {
       "field_id": "VS_POS_SIT",
@@ -405,7 +432,8 @@
       "label": "Sitting",
       "source": "acroform",
       "context": "Vital Signs; Position",
-      "acroform_name": "VS_POS_SIT"
+      "acroform_name": "VS_POS_SIT",
+      "group_id": null
     },
     {
       "field_id": "VS_POS_SUP",
@@ -419,7 +447,8 @@
       "label": "Supine",
       "source": "acroform",
       "context": "Vital Signs; Position",
-      "acroform_name": "VS_POS_SUP"
+      "acroform_name": "VS_POS_SUP",
+      "group_id": null
     },
     {
       "field_id": "VS_POS_STA",
@@ -433,7 +462,8 @@
       "label": "Standing",
       "source": "acroform",
       "context": "Vital Signs; Position",
-      "acroform_name": "VS_POS_STA"
+      "acroform_name": "VS_POS_STA",
+      "group_id": null
     },
     {
       "field_id": "VS_ASSINIT",
@@ -447,7 +477,8 @@
       "label": "Assessor Initials",
       "source": "acroform",
       "context": "Vital Signs; page footer",
-      "acroform_name": "VS_ASSINIT"
+      "acroform_name": "VS_ASSINIT",
+      "group_id": null
     }
   ],
   "extracted_at": "2026-01-01T00:00:00Z"

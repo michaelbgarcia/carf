@@ -128,6 +128,27 @@ def test_checkboxes_read_their_caption_from_the_right(crfs, truth):
     assert by_id["DM_RACE_BLACK"].label == "Black or African American"
 
 
+def test_checkbox_options_answering_one_question_share_a_group_id(crfs):
+    """Sex (Male/Female) and Position (Sitting/Supine/Standing) are each a
+    horizontal row of options answering one shared question -- they should
+    carry a common group_id, distinct from each other and from unrelated
+    fields."""
+    got = extract_fields(crfs["acroform"])
+    by_id = {f.field_id: f for f in got.fields}
+
+    assert by_id["DM_SEX_M"].group_id is not None
+    assert by_id["DM_SEX_M"].group_id == by_id["DM_SEX_F"].group_id
+
+    assert by_id["VS_POS_SIT"].group_id is not None
+    assert by_id["VS_POS_SIT"].group_id == by_id["VS_POS_SUP"].group_id == by_id["VS_POS_STA"].group_id
+
+    assert by_id["VS_POS_SIT"].group_id != by_id["DM_SEX_M"].group_id
+    # Ungrouped fields -- a lone text field, and a lone checkbox with no row
+    # partner -- carry no group_id at all.
+    assert by_id["DM_USUBJID"].group_id is None
+    assert by_id["VS_SYSBP_ND"].group_id is None
+
+
 def test_grid_checkboxes_fall_through_to_the_column_header_above(crfs):
     """`Not Done` has nothing to its right, so the header five rows up wins."""
     got = extract_fields(crfs["acroform"])

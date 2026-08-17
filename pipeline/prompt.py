@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 from pathlib import Path
 
 from pipeline.models import CRFField, FieldSet
@@ -204,10 +205,91 @@ def build_spec_sheet(fieldset: FieldSet, page_indexes: list[int]) -> str:
     return buf.getvalue()
 
 
-def build_batch_instructions(
-    fieldset: FieldSet, page_indexes: list[int], batch_num: int, total_batches: int
+DEFAULT_MAX_PRECEDENT_EXAMPLES = 20
+
+_PRECEDENT_HEADER = """\
+HISTORICAL PRECEDENT
+
+The following label -> mapping pairs were recovered from prior annotated
+CRFs and may help with similar fields in this batch. Treat them as
+precedent, not a rule -- confirm against this field's own label and context
+before reusing one.
+"""
+
+
+def _label_words(label: str) -> set[str]:
+    return {w for w in re.findall(r"[A-Za-z0-9]+", label.lower()) if len(w) > 2}
+
+
+def _row_count(row: dict) -> int:
+    try:
+        return int(row.get("count", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def build_precedent_appendix(
+    lookup_rows: list[dict] | None,
+    fieldset: FieldSet,
+    page_indexes: list[int],
+    max_examples: int = DEFAULT_MAX_PRECEDENT_EXAMPLES,
 ) -> str:
-    """Short instructions text for one batch -- references the attached sheet."""
+    """Historical precedent relevant to this batch's fields, as prompt text.
+
+    Filters a corpus-wide lookup table (``pipeline.corpus_precedent
+    .build_lookup_table``, or a CSV read back via ``read_corpus_lookup_csv``)
+    down to rows whose label shares a significant word with a field label in
+    this batch, rather than dumping the whole corpus table into every prompt
+    -- consistent with "batches, not pages": static framing text stays
+    static, only what's relevant to the current batch should grow it.
+    Returns ``""`` (no section at all) when there is nothing to show, so a
+    caller can always append this without a stray empty heading.
+    """
+    if not lookup_rows:
+        return ""
+
+    batch_words: set[str] = set()
+    for f in fieldset.for_pages(page_indexes):
+        batch_words |= _label_words(f.label)
+    if not batch_words:
+        return ""
+
+    scored = [
+        (len(_label_words(row.get("label", "")) & batch_words), row)
+        for row in lookup_rows
+    ]
+    scored = [(overlap, row) for overlap, row in scored if overlap]
+    if not scored:
+        return ""
+    scored.sort(key=lambda t: (-t[0], -_row_count(t[1]), t[1].get("label", "")))
+
+    lines = [_PRECEDENT_HEADER]
+    for _overlap, row in scored[:max_examples]:
+        mapping = ".".join(p for p in (row.get("domain"), row.get("variable")) if p)
+        mapping = mapping or row.get("variable", "")
+        if row.get("condition"):
+            mapping = f"{mapping} when {row['condition']}"
+        if row.get("fixed_value"):
+            mapping = f"{mapping} = {row['fixed_value']}"
+        lines.append(f'  "{row.get("label", "")}" -> {mapping}')
+    lines.append("")
+    return "\n".join(lines)
+
+
+def build_batch_instructions(
+    fieldset: FieldSet,
+    page_indexes: list[int],
+    batch_num: int,
+    total_batches: int,
+    precedent_rows: list[dict] | None = None,
+) -> str:
+    """Short instructions text for one batch -- references the attached sheet.
+
+    ``precedent_rows``, if given, is filtered to this batch and appended as
+    an extra section after the rules -- see :func:`build_precedent_appendix`.
+    Omitted (the default), this produces exactly the same text as before
+    precedent existed.
+    """
     n_fields = len(fieldset.for_pages(page_indexes))
     total_pages = len(fieldset.pages) or 1
     header = (
@@ -218,27 +300,33 @@ def build_batch_instructions(
     first_page, last_page = page_indexes[0] + 1, page_indexes[-1] + 1
     page_span = f"page {first_page}" if first_page == last_page else f"pages {first_page}-{last_page}"
     framing = _FRAMING.format(page_span=page_span)
-    return "\n".join(
-        [
-            header,
-            "=" * len(header),
-            "",
-            framing,
-            f"This batch covers {n_fields} fields. Attach or paste the accompanying "
-            f"{SHEET_FILENAME.format(n=batch_num)} alongside this text.",
-            "",
-            _RULES,
-            _FORMAT.format(n_columns=len(SHEET_COLUMNS)),
-            _REMINDER,
-            "",
-        ]
-    )
+
+    parts = [
+        header,
+        "=" * len(header),
+        "",
+        framing,
+        f"This batch covers {n_fields} fields. Attach or paste the accompanying "
+        f"{SHEET_FILENAME.format(n=batch_num)} alongside this text.",
+        "",
+        _RULES,
+    ]
+    appendix = build_precedent_appendix(precedent_rows, fieldset, page_indexes)
+    if appendix:
+        parts.append(appendix)
+    parts += [
+        _FORMAT.format(n_columns=len(SHEET_COLUMNS)),
+        _REMINDER,
+        "",
+    ]
+    return "\n".join(parts)
 
 
 def write_batches(
     fieldset: FieldSet,
     out_dir: str | Path,
     max_fields_per_batch: int = DEFAULT_MAX_FIELDS_PER_BATCH,
+    precedent_rows: list[dict] | None = None,
 ) -> list[dict]:
     """Write instructions + spec sheet for every batch.
 
@@ -246,6 +334,11 @@ def write_batches(
     "instructions": Path, "sheet": Path, "expected_response": Path}`` -- which
     ``scripts/ingest_response.py`` reads back to know what to look for and
     where each batch's fields came from, without re-deriving batching logic.
+
+    ``precedent_rows`` is optional and defaults to ``None`` (no precedent
+    section, byte-identical output to before precedent existed) -- pass the
+    result of ``pipeline.corpus_precedent.build_lookup_table`` or
+    ``read_corpus_lookup_csv`` to include it.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -256,7 +349,8 @@ def write_batches(
         instructions_path = out_dir / INSTRUCTIONS_FILENAME.format(n=i)
         sheet_path = out_dir / SHEET_FILENAME.format(n=i)
         instructions_path.write_text(
-            build_batch_instructions(fieldset, pages, i, len(batches)), encoding="utf-8"
+            build_batch_instructions(fieldset, pages, i, len(batches), precedent_rows),
+            encoding="utf-8",
         )
         sheet_path.write_text(build_spec_sheet(fieldset, pages), encoding="utf-8")
         manifest.append(
