@@ -96,16 +96,22 @@ For each row, fill in the empty columns using the rules below.
 _RULES = """\
 RULES
 
-1. DOMAIN. Assign the two-letter SDTM domain from the row's content and the
+1. KIND. Leave the "kind" column empty for an ordinary variable mapping.
+   That is the default and covers nearly every row. Set it to "note" only for
+   a row carrying no submitted data (rule 7). The only other accepted value is
+   "domain", for a page-level domain banner -- you are not asked to produce
+   those, so do not use it. Do not invent any other value for this column.
+
+2. DOMAIN. Assign the two-letter SDTM domain from the row's content and the
    form it sits on (DM for demographics, VS for vital signs, AE for adverse
    events, CM for concomitant medications, and so on). The "form" column names
    the CRF form and is your strongest signal.
 
-2. VARIABLE. Give the SDTM variable name without the domain prefix where the
+3. VARIABLE. Give the SDTM variable name without the domain prefix where the
    domain is already stated, e.g. domain "DM", variable "SEX". For findings
    domains the result variable is normally --ORRES.
 
-3. TESTCD CONDITION. Findings-class domains (VS, LB, EG, ...) reuse one result
+4. TESTCD CONDITION. Findings-class domains (VS, LB, EG, ...) reuse one result
    variable across many rows, so a row of the CRF is identified by a condition
    rather than a distinct variable. Where a spec-sheet row is one such CRF
    row, set "variable" to the result variable and "condition" to the test
@@ -114,41 +120,41 @@ RULES
        condition: VSTESTCD = SYSBP
    Leave "condition" empty for rows that need no such qualifier.
 
-4. TWO VARIABLES ON ONE ROW. Where one printed line captures two SDTM
+5. TWO VARIABLES ON ONE ROW. Where one printed line captures two SDTM
    variables -- an age and its unit, a result and its unit -- put the second
    in "variable2". Do not add a row for it.
 
-5. OPTION ROWS. A row whose "text_1" is empty is an option under the question
+6. OPTION ROWS. A row whose "text_1" is empty is an option under the question
    above it. Annotate it only where the option itself needs its own mapping,
    e.g. "RACE = ASIAN". Otherwise leave it blank.
 
-6. NOT SUBMITTED. Page furniture that carries no submitted data -- page
+7. NOT SUBMITTED. Page furniture that carries no submitted data -- page
    numbers, form version strings, banners, investigator or assessor initials,
    "page 1 of 3" footers, instruction paragraphs -- maps to no SDTM variable.
-   For these set "kind" to "note", leave "domain" and "variable" empty, and
-   set "origin" to NotSubmitted.
+   For these set "kind" to "note" (rule 1), leave "domain" and "variable"
+   empty, and set "origin" to NotSubmitted.
 
-7. ORIGIN. Use the Define-XML v2.1 origin type, exactly one of: Collected,
+8. ORIGIN. Use the Define-XML v2.1 origin type, exactly one of: Collected,
    Derived, Assigned, Protocol, eDT, Predecessor, NotSubmitted. A value
    written on the form by a site is Collected. A value calculated from other
    fields is Derived. A constant such as a units label is Assigned.
 
-8. CODELIST. Where the row is a controlled-terminology item (sex, race,
+9. CODELIST. Where the row is a controlled-terminology item (sex, race,
    ethnicity, position, units), give the CDISC codelist name or C-code in
    "codelist". Otherwise leave it empty.
 
-9. CONFIDENCE. In the "confidence" column, score your own certainty from 0.0
+10. CONFIDENCE. In the "confidence" column, score your own certainty from 0.0
    to 1.0. Use below 0.7 where the question text is ambiguous, where the
    domain is a guess, or where you had to choose between two plausible
    variables. Do not inflate these -- a human reviews every row and low scores
    are used to prioritise that review.
 
-10. RATIONALE. In the "rationale" column, give one short sentence saying why
+11. RATIONALE. In the "rationale" column, give one short sentence saying why
    you chose that domain/variable for this row. This is what a reviewer reads
    first, so make it concrete: name the question text or form that drove the
    decision, not a restatement of the mapping itself.
 
-11. Do not add, remove, reorder, merge, or split rows. Do not alter the
+12. Do not add, remove, reorder, merge, or split rows. Do not alter the
    row_id, page, form, text_1, or text_2 columns -- return them exactly as
    given. One filled-in row per input row.
 """

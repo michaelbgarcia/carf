@@ -17,7 +17,7 @@ import io
 import pytest
 
 from pipeline.rows import extract_rows
-from pipeline.models import ReviewStatus
+from pipeline.models import AnnotationKind, ReviewStatus
 from pipeline.parse_response import (
     IncompleteResponseError,
     ResponseParseError,
@@ -86,6 +86,31 @@ def _as_markdown_table(csv_text: str) -> str:
 
 def test_parses_a_clean_csv():
     assert parse_proposals(CLEAN)[0].variable == "SITEID"
+
+
+def test_blank_kind_cell_falls_back_to_variable():
+    """The instructions only ever tell Copilot to fill "kind" for note rows, so
+    a real reply leaves it empty on nearly every row. An empty cell scrubs to
+    None, which used to defeat the field default and fail the whole batch on an
+    enum error."""
+    blank_kind = CLEAN.replace(",variable,DM,SITEID", ",,DM,SITEID")
+    proposal = parse_proposals(blank_kind)[0]
+    assert proposal.kind is AnnotationKind.VARIABLE
+    assert proposal.variable == "SITEID"
+
+
+@pytest.mark.parametrize("cell", ["Variable", "VARIABLE", " note ", "Domain"])
+def test_kind_is_case_insensitive(cell):
+    """Same leniency as origin: a chat reply capitalises this column about as
+    often as not, and that is not worth a re-paste."""
+    text = CLEAN.replace(",variable,DM,SITEID", f",{cell},DM,SITEID")
+    assert parse_proposals(text)[0].kind is AnnotationKind.coerce(cell)
+
+
+def test_unknown_kind_still_fails_loudly():
+    text = CLEAN.replace(",variable,DM,SITEID", ",question,DM,SITEID")
+    with pytest.raises(ResponseParseError, match="not an annotation kind"):
+        parse_proposals(text)
 
 
 def test_parses_a_markdown_table_reformatting():

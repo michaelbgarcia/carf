@@ -72,6 +72,27 @@ class AnnotationKind(str, Enum):
     VARIABLE = "variable"
     NOTE = "note"
 
+    @classmethod
+    def coerce(cls, value: object) -> "AnnotationKind":
+        """Case-insensitive lookup, the same leniency as :meth:`Origin.coerce`.
+
+        This value arrives from the same human-typed sources -- a chat reply
+        pasted out of Copilot returns ``"Variable"`` or ``"NOTE"`` about as
+        often as the canonical spelling, and failing a whole batch over the
+        capitalisation of a column whose only interesting value is ``note``
+        costs a re-paste for nothing.
+        """
+        if isinstance(value, cls):
+            return value
+        key = str(value).strip().replace(" ", "").replace("_", "").replace("-", "").lower()
+        for member in cls:
+            if member.value == key:
+                return member
+        raise ValueError(
+            f"{value!r} is not an annotation kind "
+            f"(expected one of: {', '.join(m.value for m in cls)})"
+        )
+
 
 class Origin(str, Enum):
     """Define-XML v2.1 origin types."""
@@ -346,6 +367,21 @@ class CopilotProposal(BaseModel):
     @classmethod
     def _upper(cls, v: object) -> object:
         return v.strip().upper() if isinstance(v, str) else v
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def _coerce_kind(cls, v: object) -> object:
+        """A blank ``kind`` cell means the ordinary case, not a validation error.
+
+        ``parse_response._scrub`` turns every empty cell into ``None``, and an
+        explicit ``None`` defeats the field default -- so a sheet that came back
+        with this column left empty (the common reply, since only note rows were
+        ever told to fill it in) failed *every* row on an enum error. Falling
+        back to the default here is what makes "left it blank" mean ``variable``.
+        """
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return AnnotationKind.VARIABLE
+        return AnnotationKind.coerce(v)
 
     @field_validator("origin", mode="before")
     @classmethod
