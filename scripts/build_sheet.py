@@ -19,6 +19,12 @@ The normal path stops at the control sheet: open it, fill the blank annotation
 cells, set review_status, then run annotate.py. Grey cells were pre-populated
 from prior annotated CRFs and still need a look.
 
+Runs of consecutive rows that precedent gave the *same* annotation are folded
+into one grouped annotation (--no-group-repeats opts out), which is how a
+repeating block gets one box instead of a column of identical ones. It shows up
+as a shared key in the sheet's `group` column, greyed like any other suggestion;
+clearing a row's key takes it back out of the group.
+
 The Copilot batches are for when precedent leaves too many rows blank to type
 out by hand. Paste a batch's instructions into Copilot 365 chat, attach the
 sheet, save the reply verbatim to build/copilot_batchN_response.csv, and run
@@ -40,7 +46,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pipeline import control_sheet, layout, prompt, rows as rows_mod, stamp  # noqa: E402
+from pipeline import (  # noqa: E402
+    control_sheet,
+    grouping,
+    layout,
+    prompt,
+    rows as rows_mod,
+    stamp,
+)
 from pipeline.corpus_precedent import match_precedent, read_corpus_lookup_csv  # noqa: E402
 from pipeline.models import AnnotationSet  # noqa: E402
 from pipeline.msg import apply_colors  # noqa: E402
@@ -70,6 +83,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--no-preview", action="store_true", help="skip build/qc_preview.pdf"
+    )
+    parser.add_argument(
+        "--no-group-repeats",
+        action="store_true",
+        help=(
+            "pre-populate every row of a repeating block separately instead of "
+            "folding identical runs into one grouped annotation"
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -102,6 +123,12 @@ def main(argv: list[str] | None = None) -> int:
         if lookup
         else AnnotationSet(source_pdf=str(args.pdf), pages=rows.pages, annotations=[])
     )
+    # Before placement: precedent pre-populates each row of a repeating block
+    # separately, which is a column of identical boxes unless the run is folded
+    # into one group first. The reviewer sees the result as a group key in the
+    # sheet and can undo it by clearing the cells.
+    if not args.no_group_repeats:
+        proposals = grouping.collapse_repeats(proposals, rows)
     proposals = apply_colors(proposals, rows)
     proposals = layout.place_annotations(
         proposals, rows, obstacles=layout.text_obstacles(args.pdf)
@@ -110,11 +137,17 @@ def main(argv: list[str] | None = None) -> int:
     proposals_path = args.build_dir / "proposals.json"
     proposals_path.write_text(proposals.model_dump_json(indent=2), encoding="utf-8")
 
-    matched = {a.row_id for a in proposals.annotations if a.row_id}
+    matched = {r for a in proposals.annotations for r in a.covered_row_ids}
     print(
         f"\n{len(matched)} of {len(rows.rows)} rows pre-populated from precedent "
         f"-> {proposals_path}"
     )
+    n_groups, n_grouped_rows = grouping.summarize(proposals)
+    if n_groups:
+        print(
+            f"{n_grouped_rows} of them carry repeating annotations, folded into "
+            f"{n_groups} group(s) -- see the sheet's `group` column"
+        )
 
     sheet_path = control_sheet.write_control_sheet(
         rows, args.build_dir / "control_sheet.xlsx", proposals

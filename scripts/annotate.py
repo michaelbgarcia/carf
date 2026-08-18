@@ -10,6 +10,14 @@ build/rows.json is still read, for two things the sheet cannot carry: the page
 geometry annotations are positioned against, and the form grouping that decides
 MSG colour order.
 
+Rows sharing a `group` key render as **one** box covering the block -- the
+repeating-annotation case. Note what this step does *not* do: it never folds
+identical annotations into a group by itself. Grouping is a decision, it is
+visible in the sheet's `group` column, and a reviewer signed off on the sheet;
+re-deriving it here would put a box on the artifact that nobody reviewed.
+`build_sheet.py` is where runs of identical pre-populated annotations get
+collapsed, in time for a human to see it.
+
 Styling follows Metadata Submission Guidelines v2.0 -- black text on a
 domain-coloured fill, dashed borders on comment notes, and a domain legend at the
 top of each page. Annotations stay as PDF markup, never flattened into page
@@ -30,13 +38,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pymupdf  # noqa: E402
 
-from pipeline import control_sheet, layout, xfdf as xfdf_mod  # noqa: E402
+from pipeline import control_sheet, grouping, layout, xfdf as xfdf_mod  # noqa: E402
 from pipeline.models import AnnotationKind, ReviewStatus, RowSet  # noqa: E402
 from pipeline.msg import apply_colors, page_color_map  # noqa: E402
 from pipeline.render import (  # noqa: E402
     FONT,
     FONT_SIZE,
     draw_annotation,
+    draw_group_bracket,
     draw_legend,
     legend_origin,
     save_with_annotations,
@@ -65,6 +74,30 @@ def _overflowing(annotations) -> list[tuple[str, str, float]]:
     return out
 
 
+def _group_overruns(annotations, rows: RowSet) -> list[tuple[str, float]]:
+    """Grouped boxes that run into a member row's response column.
+
+    A single-row annotation cannot do this -- ``layout.place_row`` wraps it to
+    the line below when it would. A grouped one has nowhere to wrap to (below it
+    are its own member rows), so it stays put and overflows, which is a real
+    collision with the form's printed text rather than a cosmetic one. Reported,
+    not corrected: shortening the reviewer's text or moving the box are both
+    decisions this step has no standing to make.
+    """
+    pages = {p.page_index: p for p in rows.pages}
+    out = []
+    for a in annotations:
+        if not a.is_grouped or a.page_index not in pages:
+            continue
+        members = [r for r in (rows.by_id(m) for m in a.covered_row_ids) if r is not None]
+        if not members:
+            continue
+        over = a.bbox.x1 - layout.group_limit(members, pages[a.page_index])
+        if over > 0.5:
+            out.append((a.annot_id, over))
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("pdf", type=Path, help="blank CRF PDF")
@@ -81,6 +114,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--no-legend", action="store_true", help="skip the page-top domain legend"
+    )
+    parser.add_argument(
+        "--brackets",
+        action="store_true",
+        help=(
+            "draw a bracket spanning the rows each grouped annotation covers "
+            "(default: off, matching the plain centred box in the guidelines' "
+            "own examples)"
+        ),
     )
     parser.add_argument(
         "--allow-unreviewed",
@@ -125,6 +167,13 @@ def main(argv: list[str] | None = None) -> int:
     for annot_id, text, by in overflow:
         print(f"warning: {annot_id} text is {by:.1f}pt wider than its box: {text!r}")
 
+    overruns = _group_overruns(annotations.submittable(), rows)
+    for annot_id, by in overruns:
+        print(
+            f"warning: grouped annotation {annot_id} extends {by:.1f}pt into the "
+            "response column of a row it covers"
+        )
+
     by_page = {} if args.no_legend else page_color_map(annotations, rows)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -150,6 +199,16 @@ def main(argv: list[str] | None = None) -> int:
                 dashed=annot.kind is AnnotationKind.NOTE,
             )
             drawn += 1
+            if args.brackets and annot.is_grouped:
+                members = [
+                    r for r in (rows.by_id(m) for m in annot.covered_row_ids) if r is not None
+                ]
+                if members:
+                    draw_group_bracket(
+                        doc[annot.page_index],
+                        layout.block_anchor(members),
+                        annot.bbox,
+                    )
 
         for page_index, colors in by_page.items():
             page = doc[page_index]
@@ -161,10 +220,17 @@ def main(argv: list[str] | None = None) -> int:
 
     label = " (UNREVIEWED - dry run)" if unreviewed else ""
     print(f"{drawn} annotations -> {args.out}{label}")
+    n_groups, n_grouped_rows = grouping.summarize(annotations)
+    if n_groups:
+        print(
+            f"{n_groups} of them are grouped, covering {n_grouped_rows} rows between them"
+        )
     if by_page:
         print(f"domain legend drawn on {len(by_page)} page(s)")
     if overflow:
         print(f"{len(overflow)} annotation(s) overflow their box -- see warnings above")
+    if overruns:
+        print(f"{len(overruns)} grouped annotation(s) overrun a response column")
 
     if args.xfdf:
         written = xfdf_mod.write_xfdf(annotations, args.xfdf, source_pdf=str(args.pdf))

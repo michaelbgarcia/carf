@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import csv
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional
 
@@ -322,6 +322,12 @@ class RecoveredMapping:
     domain_inferred: bool = False  # True if `domain` did not come from this mark's own text
     domain_inference_source: Optional[str] = None  # "banner" | "legend" | "builtin" | "precedent"
     row_id: Optional[str] = None
+    #: Every row the one drawn box covered, when it was a grouped annotation.
+    #: A grouped mark is expanded into one of these records *per member*, each
+    #: with its own `row_id` and `label`, so precedent mining learns the mapping
+    #: for all five rows of a block rather than for whichever one sat nearest.
+    #: This field is what still says they came from a single box.
+    member_row_ids: list[str] = field(default_factory=list)
     label: Optional[str] = None  # the matched row's text_1 -- the lookup key
     context: Optional[str] = None  # form and response column, for disambiguation
     match_distance: Optional[float] = None  # points, centre-to-centre; None if unmatched
@@ -609,6 +615,78 @@ def _reverse_layout_score(mark_bbox: BBox, row: CRFRow) -> Optional[float]:
     return None
 
 
+#: Ranks a reconstructed group between an exact slot-1 hit (0.0) and the
+#: "somewhere right of slot 1 on this baseline" slot-2 guess (0.5). A genuine
+#: single-row annotation still wins its own row outright; a genuine grouped one
+#: wins against the slot-2 guess, which is the only single-row shape it can
+#: collide with.
+_GROUP_SCORE = 0.25
+#: A grouped box is centred on its block, so its centre lands mid-block rather
+#: than on any row's baseline. The slack is a full line step: the block's own
+#: extent is measured from glyph metrics, and one row of leading either way is
+#: the difference between "centred on these five rows" and "not this block".
+_GROUP_CENTRE_TOL = layout.LINE_STEP / 2.0
+
+
+def _reverse_group_score(
+    mark_bbox: BBox, page_rows: list[CRFRow]
+) -> Optional[tuple[float, list[str]]]:
+    """The block ``layout.place_group`` would have centred this mark on, if any.
+
+    The grouped counterpart of :func:`_reverse_layout_score`, and it matters for
+    the same reason: without it, one box covering five rows comes back attached
+    to whichever single row its centre happens to sit nearest, and the corpus
+    learns that mapping for one row's text while forgetting it for the other
+    four. That is worse than not recovering it -- it is a wrong answer with a
+    plausible ``match_distance``.
+
+    Reconstructing it is the same arithmetic run backwards. ``place_group`` puts
+    the box at ``block.x1 + GAP``, vertically centred on the block, so a run of
+    consecutive rows is the answer when its block's right edge lands at the
+    mark's left edge and its centre lands at the mark's centre.
+
+    **Inverting a set is under-determined, and the tie-break is deliberate.**
+    Several runs can satisfy both tests: a longer run symmetric about the same
+    centre, containing the same widest row, produces the same two numbers. The
+    smallest matching run is taken, on the bias this codebase already applies to
+    the same shape of choice in ``rows._merge_wrapped`` -- under-claiming is
+    recoverable (a row keeps its own precedent entry, or gets none), while
+    over-claiming attributes a mapping to rows that never carried it, and
+    nothing downstream can tell that it happened.
+
+    Returns ``(score, member_row_ids)``, or ``None``. Runs of one are never
+    returned: that shape is exactly the single-row case, which
+    :func:`_reverse_layout_score` already answers more precisely.
+
+    One configuration is genuinely ambiguous and is resolved by policy rather
+    than by geometry. When a block has an odd number of uniform-height rows and
+    its **widest row is the middle one**, ``place_group``'s centred box lands on
+    that row's own baseline to within the border inflation -- the two functions
+    produce the same rect, so no tolerance can separate them. This is ranked
+    behind an exact single-row hit (see ``_GROUP_SCORE``) so that case reads as
+    the single-row annotation, which claims less. The shape this exists for --
+    a question row followed by narrower option rows -- is not affected: the
+    question row is the widest and sits at the top of the block, so no single
+    row's baseline is anywhere near the box.
+    """
+    _, mark_cy = _center(mark_bbox)
+
+    for length in range(2, len(page_rows) + 1):  # smallest run first
+        for i in range(0, len(page_rows) - length + 1):
+            block = page_rows[i : i + length]
+            # Through `block_anchor` rather than re-deriving the union here, so
+            # the reconstruction cannot drift from the placement it inverts --
+            # which half of a row the block's right edge comes from is exactly
+            # the kind of rule that would drift.
+            span = layout.block_anchor(block)
+            if abs(mark_bbox.x0 - (span.x1 + layout.GAP)) > _ALIGN_TOL:
+                continue
+            if abs(mark_cy - (span.y0 + span.y1) / 2.0) > _GROUP_CENTRE_TOL:
+                continue
+            return (_GROUP_SCORE, [r.row_id for r in block])
+    return None
+
+
 def match_marks_to_rows(
     mappings: list[RecoveredMapping],
     rows: RowSet,
@@ -623,6 +701,11 @@ def match_marks_to_rows(
        reconstructs ``layout.place_row``'s own arithmetic and asks "is this mark
        exactly where that function would have put it for this row?". For this
        pipeline's own output the answer is unambiguous.
+    1b. **Grouped alignment** (:func:`_reverse_group_score`) -- the same
+       question asked of ``layout.place_group``: is this mark centred on a run
+       of consecutive rows, just past the widest of them? A mark that matches is
+       expanded into one mapping *per member row*, so every row of a repeating
+       block contributes its own precedent entry.
     2. **Nearest-row fallback** (:func:`_proximity`) -- for anything with no
        exact alignment: a third-party aCRF that was never positioned by this
        codebase, or one a reviewer moved by hand in Acrobat. Ranked behind every
@@ -646,49 +729,67 @@ def match_marks_to_rows(
     for row in rows.rows:
         rows_by_page.setdefault(row.page_index, []).append(row)
 
-    # (rank, mark_index, row_id, reported_distance) -- `rank` decides match order
-    # (tier 1 always ahead of tier 2) and is a wrap count or a clamped proximity;
-    # `reported_distance` is always plain centre-to-centre, kept separately so
-    # ``match_distance`` stays a single comparable number in the report whichever
-    # tier produced the match.
-    candidates: list[tuple[float, int, str, float]] = []
+    # (rank, mark_index, row_id, reported_distance, members) -- `rank` decides
+    # match order (tier 1 always ahead of tier 2) and is a wrap count, a group
+    # score or a clamped proximity; `reported_distance` is always plain
+    # centre-to-centre, kept separately so ``match_distance`` stays a single
+    # comparable number in the report whichever tier produced the match.
+    # `members` is non-empty only for a grouped match.
+    candidates: list[tuple[float, int, str, float, tuple[str, ...]]] = []
     for i, m in enumerate(mappings):
         if m.kind == "domain":
             continue
-        for row in rows_by_page.get(m.page_index, []):
+        page_rows = rows_by_page.get(m.page_index, [])
+        for row in page_rows:
             d = _distance(m.bbox, row.anchor)
             aligned = _reverse_layout_score(m.bbox, row)
             if aligned is not None:
-                candidates.append((aligned, i, row.row_id, d))
+                candidates.append((aligned, i, row.row_id, d, ()))
             else:
                 near = _proximity(m.bbox, row.anchor)
                 if near <= max_distance:
-                    candidates.append((near + _CENTROID_OFFSET, i, row.row_id, d))
+                    candidates.append((near + _CENTROID_OFFSET, i, row.row_id, d, ()))
+
+        grouped = _reverse_group_score(m.bbox, page_rows)
+        if grouped is not None:
+            score, members = grouped
+            anchor = rows.by_id(members[0])
+            assert anchor is not None  # members come from this page's own rows
+            candidates.append(
+                (score, i, members[0], _distance(m.bbox, anchor.anchor), tuple(members))
+            )
     candidates.sort(key=lambda t: t[0])
 
-    chosen: dict[int, tuple[str, float]] = {}
-    for _rank, i, row_id, d in candidates:
+    chosen: dict[int, tuple[str, float, tuple[str, ...]]] = {}
+    for _rank, i, row_id, d, members in candidates:
         if i in chosen:
             continue
-        chosen[i] = (row_id, d)
+        chosen[i] = (row_id, d, members)
 
     out: list[RecoveredMapping] = []
     for i, m in enumerate(mappings):
         if i not in chosen:
             out.append(m)
             continue
-        row_id, dist = chosen[i]
-        row = rows.by_id(row_id)
-        assert row is not None
-        out.append(
-            replace(
-                m,
-                row_id=row_id,
-                label=row.text_1 or row.text_2,
-                context=row_context(row),
-                match_distance=dist,
+        row_id, dist, members = chosen[i]
+        # One box covering five rows becomes five records sharing one bbox. Each
+        # carries its own row's label, which is what the lookup table is keyed
+        # on, and `member_row_ids` so a consumer can still tell they were drawn
+        # once. Collapsing them back into one box is `grouping.collapse_repeats`'
+        # job on the way out, and it will, because the text is identical.
+        for member_id in members or (row_id,):
+            row = rows.by_id(member_id)
+            assert row is not None
+            out.append(
+                replace(
+                    m,
+                    row_id=member_id,
+                    member_row_ids=list(members),
+                    label=row.text_1 or row.text_2,
+                    context=row_context(row),
+                    match_distance=dist if member_id == row_id else _distance(m.bbox, row.anchor),
+                )
             )
-        )
     return out
 
 

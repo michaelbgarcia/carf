@@ -194,8 +194,17 @@ def rows_needing_annotation(
 
     Returns a ``RowSet`` rather than a list so batching, sheet building and page
     geometry all keep working unchanged on the narrowed set.
+
+    "Answered" reads ``covered_row_ids``, not ``row_id``: one grouped annotation
+    answers every row in its block, and scanning the anchor alone would batch
+    the other four off to Copilot to re-derive a mapping the sheet already
+    carries.
     """
-    answered = {a.row_id for a in (annotations.annotations if annotations else []) if a.row_id}
+    answered = {
+        row_id
+        for a in (annotations.annotations if annotations else [])
+        for row_id in a.covered_row_ids
+    }
     keep = [r for r in rows.rows if r.row_id not in answered]
     pages = [p for p in rows.pages if any(r.page_index == p.page_index for r in keep)]
     return rows.model_copy(update={"rows": keep, "pages": pages})

@@ -72,6 +72,7 @@ COLUMNS = [
     "coord1",
     "coord2",
     "domain",
+    "group",
     "anno1",
     "anno2",
     "note",
@@ -95,7 +96,7 @@ LOCKED_FILL = PatternFill("solid", fgColor="FFF2F2F2")
 
 COLUMN_WIDTHS = {
     "row_id": 12, "page": 6, "form": 16, "text_1": 52, "text_2": 22,
-    "coord1": 26, "coord2": 26, "domain": 8, "anno1": 30, "anno2": 30,
+    "coord1": 26, "coord2": 26, "domain": 8, "group": 12, "anno1": 30, "anno2": 30,
     "note": 40, "origin": 13, "source": 20, "review_status": 14, "reviewed_by": 16,
 }
 
@@ -132,20 +133,40 @@ def _parse_bbox(value: object) -> Optional[BBox]:
 
 def _annotations_by_row(
     annotations: Optional[AnnotationSet],
-) -> dict[tuple[str, int], SdtmAnnotation]:
+) -> dict[tuple[str, int], tuple[SdtmAnnotation, bool]]:
+    """``(row_id, slot) -> (annotation, is_anchor)``, groups expanded to members.
+
+    A grouped annotation appears against *every* row it covers, because that is
+    what makes the group legible and editable in a spreadsheet: five rows carry
+    the same key in the ``group`` column, and clearing one of them is how a
+    reviewer takes that row out of the group. Only the anchor carries the text
+    -- repeating it down the block would reintroduce, in the sheet, exactly the
+    duplication the group removed from the page, and leave two cells that could
+    disagree.
+    """
     if annotations is None:
         return {}
-    out: dict[tuple[str, int], SdtmAnnotation] = {}
+    out: dict[tuple[str, int], tuple[SdtmAnnotation, bool]] = {}
     for a in annotations.annotations:
-        if a.row_id:
-            out[(a.row_id, a.slot)] = a
+        for row_id in a.covered_row_ids:
+            out[(row_id, a.slot)] = (a, row_id == a.row_id)
     return out
 
 
 def _row_values(
-    row: CRFRow, first: Optional[SdtmAnnotation], second: Optional[SdtmAnnotation]
+    row: CRFRow,
+    first: Optional[tuple[SdtmAnnotation, bool]],
+    second: Optional[tuple[SdtmAnnotation, bool]],
 ) -> dict[str, object]:
-    lead = first or second
+    lead_entry = first or second
+    lead = lead_entry[0] if lead_entry else None
+
+    def cell(entry: Optional[tuple[SdtmAnnotation, bool]]) -> str:
+        if entry is None:
+            return ""
+        annot, is_anchor = entry
+        return annot.display_text() if is_anchor else ""
+
     return {
         "row_id": row.row_id,
         "page": row.display_page,
@@ -155,8 +176,9 @@ def _row_values(
         "coord1": _fmt_bbox(row.bbox_1),
         "coord2": _fmt_bbox(row.bbox_2),
         "domain": (lead.domain or "") if lead else "",
-        "anno1": first.display_text() if first else "",
-        "anno2": second.display_text() if second else "",
+        "group": (lead.group_id or "") if lead else "",
+        "anno1": cell(first),
+        "anno2": cell(second),
         "note": (lead.rationale or "") if lead and lead.kind is AnnotationKind.NOTE else "",
         "origin": (lead.origin.value if lead and lead.origin else ""),
         "source": (lead.source_model if lead else ""),
@@ -208,10 +230,13 @@ def write_control_sheet(
                 # two flags, so there is nothing to preserve from the default.
                 cell.protection = Protection(locked=False, hidden=False)
             # Grey out what was pre-populated rather than authored, so a reviewer
-            # can see what still needs looking at.
+            # can see what still needs looking at. A group key the pipeline
+            # assigned itself is greyed on the same argument: collapsing five
+            # identical annotations into one box is a decision, and a reviewer
+            # should be able to see it was made for them.
             owner = first if name in ("anno1",) else second if name == "anno2" else first or second
-            if name in ("domain", "anno1", "anno2", "origin") and owner is not None:
-                if owner.suggested and values[name]:
+            if name in ("domain", "group", "anno1", "anno2", "origin") and owner is not None:
+                if owner[0].suggested and values[name]:
                     cell.fill = SUGGESTED_FILL
 
     ws.freeze_panes = "A2"
@@ -257,6 +282,7 @@ class SheetRow:
 
     row_id: str
     domain: str = ""
+    group: str = ""
     anno1: str = ""
     anno2: str = ""
     note: str = ""
@@ -298,6 +324,7 @@ def read_control_sheet(path: str | Path) -> list[SheetRow]:
             SheetRow(
                 row_id=row_id,
                 domain=text(cells, "domain"),
+                group=text(cells, "group"),
                 anno1=text(cells, "anno1"),
                 anno2=text(cells, "anno2"),
                 note=text(cells, "note"),
@@ -345,7 +372,14 @@ def to_annotations(
     enforced by ``SdtmAnnotation`` itself, but the error is re-raised here with
     the offending spreadsheet row number, because "row 214" is actionable to a
     reviewer and a pydantic traceback is not.
+
+    Rows sharing a ``group`` key are folded into a single annotation covering
+    all of them -- see ``pipeline/grouping.py``. The annotation text is typed
+    once, on any member row; the rest carry the key and an empty cell. Grouping
+    happens here, at read time, rather than at render time, so a group that
+    cannot be resolved fails against the spreadsheet a human can fix.
     """
+    from pipeline import grouping
     from pipeline.parse_annotated_pdf import parse_mapping_text
 
     sheet_rows = read_control_sheet(path)
@@ -378,6 +412,7 @@ def to_annotations(
                         condition=condition,
                         fixed_value=fixed_value,
                         origin=sr.origin or None,
+                        group_id=sr.group or None,
                         source_model=sr.source or "human, control sheet",
                         suggested=False,
                         review_status=ReviewStatus(sr.review_status),
@@ -387,9 +422,29 @@ def to_annotations(
             except ValueError as exc:
                 raise ControlSheetError(f"row {sr.excel_row} ({sr.row_id}): {exc}") from exc
 
-    return AnnotationSet(
+    annotations = AnnotationSet(
         source_pdf=source_pdf or rows.source_pdf, pages=rows.pages, annotations=out
     )
+    membership = grouping.row_membership({sr.row_id: sr.group for sr in sheet_rows})
+    if not membership:
+        return annotations
+    try:
+        return grouping.resolve_groups(annotations, rows, membership)
+    except grouping.GroupingError as exc:
+        raise ControlSheetError(f"{exc}{_sheet_rows_hint(exc.row_ids, sheet_rows)}") from exc
+
+
+def _sheet_rows_hint(row_ids: list[str], sheet_rows: list[SheetRow]) -> str:
+    """Translate row ids in a grouping error into spreadsheet line numbers.
+
+    ``grouping`` deals in ``row_id`` because that is the pipeline's join key,
+    but a reviewer is looking at a spreadsheet -- "row 214" is what they can act
+    on, and it is the same argument the per-row errors above already make.
+    """
+    lines = sorted({sr.excel_row for sr in sheet_rows if sr.row_id in set(row_ids)})
+    if not lines:
+        return ""
+    return "  (spreadsheet row(s) " + ", ".join(str(n) for n in lines) + ")"
 
 
 __all__ = [

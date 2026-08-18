@@ -125,6 +125,12 @@ def annotation_to_element(annot: SdtmAnnotation) -> ET.Element:
     for key, value in (
         ("row_id", annot.row_id),
         ("slot", str(annot.slot)),
+        # A grouped annotation is one box asserting a mapping for several rows.
+        # The rect alone cannot say which rows those are, and Acrobat has no
+        # concept to map it onto, so the membership rides in our own namespace
+        # -- the one place a round trip can recover it from.
+        ("group_id", annot.group_id),
+        ("member_row_ids", " ".join(annot.member_row_ids)),
         ("domain", annot.domain),
         ("variable", annot.variable),
         ("condition", annot.condition),

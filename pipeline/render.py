@@ -163,6 +163,60 @@ def draw_annotation(
     return annot
 
 
+#: Bracket geometry: how far the tick arms reach back toward the rows, and how
+#: far the bracket sits left of the annotation box it belongs to.
+BRACKET_ARM = 3.0
+BRACKET_GAP = 2.0
+BRACKET_WIDTH = 0.75
+
+
+def draw_group_bracket(
+    page: pymupdf.Page,
+    block: BBox,
+    box: BBox,
+    *,
+    color: Optional[tuple[int, int, int]] = None,
+) -> Optional[pymupdf.Annot]:
+    """Draw the ``[`` spanning the rows one grouped annotation covers.
+
+    A single box beside five rows is, on its own, ambiguous with a box beside
+    the one row it happens to align with -- centring helps a reader and does not
+    settle it. The bracket settles it: it spans the block's full vertical
+    extent, so the rows the annotation claims are stated on the page rather than
+    inferred from a gap.
+
+    Drawn as a **polyline annot**, not into the page's content stream. The rule
+    ``save_with_annotations`` protects -- annotations stay markup, separable
+    from the form -- applies to a bracket exactly as much as to the box it
+    belongs to; drawing it as content would edit the blank CRF itself.
+
+    ``color`` is an MSG fill, and is left unset by both renderers on purpose:
+    those fills are pale pastels chosen to be read *through*, and a bracket
+    drawn in one is very nearly invisible against the page. The default dark
+    ink is the same choice the annotation's own border makes.
+
+    Returns ``None`` when the geometry says the box is not beside this block,
+    which is the caller having grouped something this cannot draw.
+    """
+    if block.height <= 0 or box.x0 <= block.x1:
+        return None
+
+    h = page.rect.height
+    x = max(block.x1 + BRACKET_GAP, box.x0 - BRACKET_ARM - BRACKET_GAP)
+    top, bottom = h - block.y1, h - block.y0  # fitz space, y down
+    points = [
+        pymupdf.Point(x + BRACKET_ARM, top),
+        pymupdf.Point(x, top),
+        pymupdf.Point(x, bottom),
+        pymupdf.Point(x + BRACKET_ARM, bottom),
+    ]
+    annot = page.add_polyline_annot(points)
+    annot.set_border(width=BRACKET_WIDTH)
+    annot.set_colors(stroke=to_pdf_color(color) if color else NOTE_TEXT_COLOR)
+    annot.update()
+    return annot
+
+
 def legend_origin(
     page: pymupdf.Page,
     *,

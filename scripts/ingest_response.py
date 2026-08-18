@@ -110,7 +110,10 @@ def main(argv: list[str] | None = None) -> int:
         if proposals_path.exists()
         else []
     )
-    already = {a.row_id for a in existing if a.row_id}
+    # covered_row_ids, not row_id: a grouped precedent annotation already answers
+    # every row in its block, and asking Copilot about the other members would
+    # re-derive a mapping the sheet is already carrying.
+    already = {row_id for a in existing for row_id in a.covered_row_ids}
 
     # The batches were built from the narrowed row set, so completeness has to be
     # checked against that same set -- the full one would report every
@@ -139,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
             # rather than leaving a silent gap in the annotation set.
             raise SystemExit(exc.report()) from exc
         collected.extend(result.annotations)
-        covered.update(a.row_id for a in result.annotations if a.row_id)
+        covered.update(row_id for a in result.annotations for row_id in a.covered_row_ids)
 
     # Completeness across the whole document, not just within each batch --
     # catches a batch missing from the manifest entirely.

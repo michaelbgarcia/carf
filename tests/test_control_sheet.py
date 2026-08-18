@@ -238,6 +238,79 @@ def test_round_trips_a_reviewed_sheet(tmp_path, rows, proposals):
     assert slots[1].origin is Origin.COLLECTED
 
 
+def test_a_group_key_folds_its_rows_into_one_annotation(tmp_path, rows):
+    """The repeating-annotation shape: the mapping typed once, the key on every
+    row of the block."""
+    path = write_control_sheet(rows, tmp_path / "cs.xlsx")
+    _edit(path, "p1_r001", group="g1", anno1="DSTERM",
+          review_status="accepted", reviewed_by="mgarcia")
+    _edit(path, "p1_r002", group="g1", review_status="accepted", reviewed_by="mgarcia")
+    _edit(path, "p1_r003", group="g1", review_status="accepted", reviewed_by="mgarcia")
+
+    out = to_annotations(path, rows)
+
+    (annot,) = out.annotations
+    assert annot.row_id == "p1_r001"
+    assert annot.member_row_ids == ["p1_r001", "p1_r002", "p1_r003"]
+    assert annot.display_text() == "DSTERM"
+    assert annot.group_id == "g1"
+
+
+def test_a_group_whose_rows_disagree_names_the_spreadsheet_lines(tmp_path, rows):
+    """Row ids are the pipeline's join key; a reviewer is looking at a
+    spreadsheet, so the error has to name lines they can go to."""
+    path = write_control_sheet(rows, tmp_path / "cs.xlsx")
+    _edit(path, "p1_r001", group="g1", anno1="DSTERM")
+    _edit(path, "p1_r002", group="g1", anno1="DSDECOD")
+
+    with pytest.raises(ControlSheetError) as exc:
+        to_annotations(path, rows)
+    assert "spreadsheet row(s) 2, 3" in str(exc.value)
+
+
+def test_a_grouped_annotation_writes_its_key_to_every_member_row(tmp_path, rows):
+    """Five rows carrying the key is what makes the group visible and editable:
+    clearing one cell is how a reviewer takes that row out of it. Only the
+    anchor carries the text -- repeating it would reintroduce in the sheet the
+    duplication the group removed from the page."""
+    grouped = AnnotationSet(
+        source_pdf="synthetic.pdf",
+        pages=[PAGE],
+        annotations=[
+            _annot(
+                "p1_r001", 1, text="DSTERM", group_id="g1",
+                member_row_ids=["p1_r001", "p1_r002"], suggested=True,
+            )
+        ],
+    )
+    cells = _cells(write_control_sheet(rows, tmp_path / "cs.xlsx", grouped))
+
+    assert cells["p1_r001"]["group"] == "g1"
+    assert cells["p1_r002"]["group"] == "g1"
+    assert cells["p1_r001"]["anno1"] == "DSTERM"
+    assert cells["p1_r002"]["anno1"] in (None, "")
+    assert cells["p1_r003"]["group"] in (None, "")
+
+
+def test_an_assigned_group_key_is_greyed_like_any_other_suggestion(tmp_path, rows):
+    grouped = AnnotationSet(
+        source_pdf="synthetic.pdf",
+        pages=[PAGE],
+        annotations=[
+            _annot(
+                "p1_r001", 1, text="DSTERM", group_id="g_p1_r001",
+                member_row_ids=["p1_r001", "p1_r002"], suggested=True,
+            )
+        ],
+    )
+    path = write_control_sheet(rows, tmp_path / "cs.xlsx", grouped)
+    ws = _sheet(path)
+    header = [c.value for c in ws[1]]
+    column = header.index("group") + 1
+    assert ws.cell(row=2, column=column).fill.fgColor.rgb == SUGGESTED_FILL.fgColor.rgb
+    assert ws.cell(row=3, column=column).fill.fgColor.rgb == SUGGESTED_FILL.fgColor.rgb
+
+
 def test_literal_text_wins_over_the_structured_fields(tmp_path, rows):
     """A reviewer's exact wording is what gets drawn.
 

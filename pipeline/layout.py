@@ -48,7 +48,7 @@ from dataclasses import dataclass
 
 import pymupdf
 
-from pipeline.models import AnnotationSet, BBox, PageGeometry, RowSet, SdtmAnnotation
+from pipeline.models import AnnotationSet, BBox, CRFRow, PageGeometry, RowSet, SdtmAnnotation
 
 FONT = "helv"
 FONT_SIZE = 7.0
@@ -204,6 +204,98 @@ def place_row(
     return boxes
 
 
+def block_anchor(rows: list[CRFRow]) -> BBox:
+    """The block a grouped annotation is placed against.
+
+    The vertical extent is every member's, because the box has to read as
+    belonging to all of them. The horizontal extent is **the question halves
+    only** when the block has any, which is the part that is not obvious::
+
+        Please record
+        protocol version    [ SUPPDS.QVAL when QNAM = "PROTVER" ]  Original    O
+        on which subject                                          Amendment 1  O
+        is currently                                              Amendment 2  O
+        enrolled:                                                 Amendment 3  O
+
+    Those option rows are option-*only* rows, so ``anchor`` is their response
+    bbox, over on the right. Taking the widest anchor would put the box past the
+    options instead of in the gutter between the two columns -- off the right of
+    the block it is annotating. Clearing the question halves is what puts it
+    where a human writes it, and :func:`group_limit` keeps it clear of the
+    responses on the other side.
+
+    A block with no question half at all -- a run of pure option rows -- falls
+    back to the anchors, which puts the box just right of the options. That is
+    the same place ``place_row`` puts a single-row annotation on an option-only
+    row, and for the same reason: nothing is printed right of a response column.
+    """
+    spans = [r.bbox_1 for r in rows if r.bbox_1 is not None] or [r.anchor for r in rows]
+    anchors = [r.anchor for r in rows]
+    return BBox(
+        x0=min(s.x0 for s in spans),
+        y0=min(a.y0 for a in anchors),
+        x1=max(s.x1 for s in spans),
+        y1=max(a.y1 for a in anchors),
+    )
+
+
+def _member_rows(annot: SdtmAnnotation, rows: RowSet) -> list[CRFRow]:
+    """The rows a grouped annotation covers, skipping any that no longer exist.
+
+    A member that has vanished from the row set means the sheet and the PDF have
+    diverged, which ``control_sheet`` catches with a better message than a
+    ``None`` dereference here would give. Falling back to the anchor keeps
+    placement working rather than crashing on the way to that error.
+    """
+    found = [rows.by_id(r) for r in annot.covered_row_ids]
+    present = [r for r in found if r is not None]
+    if present:
+        return present
+    anchor = rows.by_id(annot.row_id or "")
+    return [anchor] if anchor is not None else []
+
+
+def group_limit(rows: list[CRFRow], page: PageGeometry) -> float:
+    """How far right a grouped annotation may extend: the tightest member's limit.
+
+    One box has to clear every member's response column, not just the anchor's.
+    """
+    return min(right_limit(r, page) for r in rows)
+
+
+def place_group(
+    block: BBox,
+    texts: list[str],
+    size: float = FONT_SIZE,
+) -> list[BBox]:
+    """Lay a grouped annotation out beside the block of rows it covers.
+
+    Two differences from :func:`place_row`, both of them what the block is for:
+
+    * the box is **vertically centred** on the block instead of sitting on one
+      row's baseline, which is how a reader sees that it belongs to all of them
+      and not to whichever row it happens to align with;
+    * it keeps its **text height** rather than matching the anchor's, because
+      matching a five-row block would draw a box the size of the block and bury
+      the rows behind it.
+
+    There is no wrapping here, and that is deliberate rather than missing.
+    Wrapping exists to drop an over-long annotation onto the line below; below a
+    grouped annotation are its own member rows, so a wrap would move the box
+    *into* the block it is annotating. An over-long grouped annotation stays
+    beside its block and overflows to the right, where ``annotate.py``'s
+    overflow warning and the QC preview both show it.
+    """
+    boxes: list[BBox] = []
+    x = block.x1 + GAP
+    for text in texts:
+        w, h = annotation_size(text, size)
+        y0 = block.y0 + (block.height - h) / 2.0
+        boxes.append(BBox(x0=x, y0=y0, x1=x + w, y1=y0 + h))
+        x += w + SLOT_GAP
+    return boxes
+
+
 def text_obstacles(pdf_path) -> dict[int, list[BBox]]:
     """Bounding boxes of the form's own printed text, per page.
 
@@ -238,6 +330,11 @@ def place_annotations(
     Rows are processed in reading order so the obstacle set grows the way a
     reviewer reads, which keeps any displacement predictable.
 
+    An annotation covering several rows (``member_row_ids``) is placed against
+    the whole block by :func:`place_group` instead, centred on it. It is keyed
+    on its anchor row like any other, so a block's ``anno1``/``anno2`` still lay
+    out together and the two kinds interleave in the same reading order.
+
     Annotations with no ``row_id`` (domain legend banners) are left where they
     are: they belong to the page, not to a row, and ``render.draw_legend``
     positions them.
@@ -245,39 +342,62 @@ def place_annotations(
     pages = {p.page_index: p for p in (annotations.pages or rows.pages)}
     printed: dict[int, list[BBox]] = {k: list(v) for k, v in (obstacles or {}).items()}
 
-    by_row: dict[str, list[SdtmAnnotation]] = {}
+    # Keyed on (anchor row, grouped?) rather than on the row alone. A row can
+    # carry a grouped `anno1` and an ungrouped `anno2` -- see `collapse_repeats`,
+    # which groups per slot -- and those two need different geometry: one is
+    # centred on a block of rows, the other sits on this row's own baseline.
+    units: dict[tuple[str, bool], list[SdtmAnnotation]] = {}
     passthrough: list[SdtmAnnotation] = []
     for a in annotations.annotations:
         row = rows.by_id(a.row_id) if a.row_id else None
         if row is None or a.page_index not in pages or not a.display_text():
             passthrough.append(a)
             continue
-        by_row.setdefault(a.row_id, []).append(a)  # type: ignore[arg-type]
+        units.setdefault((a.row_id, a.is_grouped), []).append(a)  # type: ignore[arg-type]
 
-    def row_key(row_id: str) -> tuple[int, float, float]:
-        row = rows.by_id(row_id)
+    def unit_key(key: tuple[str, bool]) -> tuple[int, float, float, bool]:
+        row = rows.by_id(key[0])
         assert row is not None  # filtered above
-        return (row.page_index, -row.anchor.y1, row.anchor.x0)
+        # Grouped first within a row, so an ungrouped slot on the same row can
+        # start to the right of the block's box instead of underneath it.
+        return (row.page_index, -row.anchor.y1, row.anchor.x0, not key[1])
 
     placed: list[SdtmAnnotation] = list(passthrough)
     taken: dict[int, list[BBox]] = {}
+    group_edge: dict[str, float] = {}
 
-    for row_id in sorted(by_row, key=row_key):
+    for key in sorted(units, key=unit_key):
+        row_id, grouped = key
         row = rows.by_id(row_id)
         assert row is not None
         page = pages[row.page_index]
-        group = sorted(by_row[row_id], key=lambda a: a.slot)
+        slots = sorted(units[key], key=lambda a: a.slot)
 
-        blocking = printed.get(row.page_index, []) + taken.get(row.page_index, [])
-        boxes = place_row(
-            anchor=row.anchor,
-            texts=[a.display_text() for a in group],
-            page=page,
-            limit=right_limit(row, page),
-            obstacles=blocking,
-            size=size,
-        )
-        for a, box in zip(group, boxes):
+        if grouped:
+            block = block_anchor(_member_rows(slots[0], rows))
+            boxes = place_group(
+                block=block, texts=[a.display_text() for a in slots], size=size
+            )
+            if boxes:
+                group_edge[row_id] = boxes[-1].x1
+        else:
+            # Start past a grouped box already placed on this row, so the two do
+            # not print through each other. The anchor keeps its own y: an
+            # ungrouped slot belongs to this row alone and stays on its baseline.
+            anchor = row.anchor
+            edge = group_edge.get(row_id)
+            if edge is not None and edge > anchor.x1:
+                anchor = anchor.model_copy(update={"x1": edge + SLOT_GAP - GAP})
+            blocking = printed.get(row.page_index, []) + taken.get(row.page_index, [])
+            boxes = place_row(
+                anchor=anchor,
+                texts=[a.display_text() for a in slots],
+                page=page,
+                limit=right_limit(row, page),
+                obstacles=blocking,
+                size=size,
+            )
+        for a, box in zip(slots, boxes):
             taken.setdefault(row.page_index, []).append(box)
             placed.append(a.model_copy(update={"bbox": box}))
 

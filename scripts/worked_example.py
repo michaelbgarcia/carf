@@ -19,6 +19,10 @@ Two things it is good for:
 * **Seeing the MSG styling.** The Demographics form deliberately carries three
   domains (DM, RP, DS) so the per-form encounter-order colouring and the page-top
   legend both have something to do.
+* **Seeing grouped annotations.** ``GROUPS`` below puts the Ethnicity and
+  Position option blocks under one annotation each, and the instruction
+  paragraph under one ``[NOT SUBMITTED]`` -- three shapes of the repeating case,
+  drawn once instead of eleven times.
 
 Usage:
     python scripts/worked_example.py [--build-dir build] [--pdf <blank_crf.pdf>]
@@ -89,6 +93,35 @@ MAPPINGS: dict[str, tuple[str, str, str, str, str]] = {
     "Position": ("VS", "VSPOS", "", "", "Collected"),
 }
 
+#: ``text_1 or text_2`` -> group key, for the rows that share one annotation.
+#:
+#: The repeating case, in the three shapes it actually turns up in:
+#:
+#: * ``eth`` -- a question row plus its option-only continuation rows. The
+#:   mapping is typed once, against "Ethnicity"; the four options carry the key
+#:   and an empty cell, and one ``ETHNIC`` box covers the block.
+#: * ``pos`` -- the same shape on another form, so the grouped box is drawn
+#:   against a different domain's colour.
+#: * ``instr`` -- a paragraph of instruction text, seven consecutive rows none
+#:   of which is submitted. Without the group this is seven identical grey boxes
+#:   down the right of the page.
+GROUPS: dict[str, str] = {
+    "Ethnicity": "eth",
+    "Not Hispanic or Latino": "eth",
+    "Not Reported": "eth",
+    "Unknown": "eth",
+    "Position": "pos",
+    "Supine": "pos",
+    "Standing": "pos",
+    "Complete every page": "instr",
+    "any kind.": "instr",
+    "line, enter": "instr",
+    "original entry": "instr",
+    "Where a measurement": "instr",
+    "than leaving": "instr",
+    "during data review": "instr",
+}
+
 #: Rows that carry no submitted data. Matched as a prefix, since page furniture
 #: varies its tail ("Page 1 of 3", "Page 2 of 3", ...).
 NOT_SUBMITTED_PREFIXES = (
@@ -113,7 +146,22 @@ NOT_SUBMITTED_PREFIXES = (
 )
 
 
-def fill_sheet(sheet_path: Path, rows) -> tuple[int, int]:
+def _group_of(key: str) -> str:
+    """The group key for a row, by exact text then by prefix.
+
+    Prefix matching for the same reason ``NOT_SUBMITTED_PREFIXES`` needs it: the
+    instruction paragraph's rows are wrapped lines whose tails are whatever the
+    wrap produced.
+    """
+    if key in GROUPS:
+        return GROUPS[key]
+    for prefix, group in GROUPS.items():
+        if key.startswith(prefix):
+            return group
+    return ""
+
+
+def fill_sheet(sheet_path: Path, rows) -> tuple[int, int, int]:
     """Write the invented mappings into an existing control sheet in place.
 
     Edits the workbook rather than building one, so what gets rendered went
@@ -126,6 +174,7 @@ def fill_sheet(sheet_path: Path, rows) -> tuple[int, int]:
 
     mapped = 0
     not_submitted = 0
+    grouped = 0
     for excel_row in range(2, ws.max_row + 1):
         row_id = ws.cell(row=excel_row, column=col["row_id"]).value
         row = rows.by_id(str(row_id)) if row_id else None
@@ -135,6 +184,15 @@ def fill_sheet(sheet_path: Path, rows) -> tuple[int, int]:
 
         def put(name: str, value: str) -> None:
             ws.cell(row=excel_row, column=col[name], value=value)
+
+        # Written before the mapping branches, and independently of them: most
+        # members of a group carry the key and nothing else, so a group cell
+        # that only got written for annotated rows would leave four fifths of
+        # every block out of its own group.
+        group = _group_of(key)
+        if group:
+            put("group", group)
+            grouped += 1
 
         if key in MAPPINGS:
             domain, anno1, anno2, note, origin = MAPPINGS[key]
@@ -149,7 +207,7 @@ def fill_sheet(sheet_path: Path, rows) -> tuple[int, int]:
             put("anno1", "[NOT SUBMITTED]")
             put("origin", "NotSubmitted")
             not_submitted += 1
-        else:
+        elif not group:
             continue
 
         put("source", "hand-authored (INVENTED example data)")
@@ -162,7 +220,7 @@ def fill_sheet(sheet_path: Path, rows) -> tuple[int, int]:
     ws.protection.sheet = True
     ws.protection.enable()
     wb.save(sheet_path)
-    return mapped, not_submitted
+    return mapped, not_submitted, grouped
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -184,11 +242,12 @@ def main(argv: list[str] | None = None) -> int:
 
     sheet = args.build_dir / "control_sheet.xlsx"
     rows = rows_mod.extract_rows(args.pdf)
-    mapped, not_submitted = fill_sheet(sheet, rows)
+    mapped, not_submitted, grouped = fill_sheet(sheet, rows)
     print(
         f"\n=== filled {sheet} by hand ===\n"
         f"{mapped} mapped rows, {not_submitted} marked [NOT SUBMITTED], "
-        f"{len(rows.rows) - mapped - not_submitted} left blank"
+        f"{len(rows.rows) - mapped - not_submitted} left blank; "
+        f"{grouped} rows share a group key"
     )
 
     out = args.build_dir / "WORKED_EXAMPLE_annotated_crf.pdf"

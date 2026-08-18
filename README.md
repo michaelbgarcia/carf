@@ -7,7 +7,7 @@ styled per Metadata Submission Guidelines v2.0.
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
-pytest                              # 258 tests
+pytest                              # 305 tests
 
 python scripts/make_sample_crf.py   # the synthetic CRF -> fixtures/
 python scripts/worked_example.py    # the whole path, end to end
@@ -140,6 +140,60 @@ observed response. `tests/standin_response.py` is an explicitly-labelled
 stand-in that proves the plumbing only. When a real reply arrives, save it
 verbatim as a fixture and extend the tests from what it actually did.
 
+## Grouped (repeating) annotations
+
+A CRF asks one question and offers a block of responses, or repeats the same
+field down a log grid or across visits. Annotating each row separately gives a
+column of identical boxes; **one box covering the block** is what an annotator
+does by hand and what the finished artifact is expected to look like:
+
+```
+Please record
+protocol version         SUPPDS.QVAL when QNAM = "PROTVER"      Original    O
+on which subject        |________________________________|    Amendment 1  O
+is currently                                                  Amendment 2  O
+enrolled:                                                     Amendment 3  O
+```
+
+The annotation is still attributed to **every** row in the block
+(`member_row_ids`), so nothing downstream infers coverage from geometry — an
+unmapped-row report, a Copilot batch and the precedent miner all read
+`covered_row_ids`, not `row_id`. See [pipeline/grouping.py](pipeline/grouping.py).
+
+Two ways a group comes to exist:
+
+**Declared** — a reviewer types the same key in the control sheet's `group`
+column on each member row and fills the annotation cell once. Every member row
+carries the key, so clearing one cell is how a row leaves the group; only the
+anchor carries the text, because two cells that could disagree is the
+duplication the group just removed.
+
+**Collapsed** — `build_sheet.py` folds runs of *consecutive* rows already
+carrying an *identical* annotation into one group (`--no-group-repeats` opts
+out), which is exactly what pre-population from mined precedent produces for the
+block above. Both conditions are deliberately strict: "same variable, different
+condition" is a judgement call, and a gap means some row in the middle carries
+no annotation, so a box centred across it would assert a mapping nobody made.
+The `Race (check all that apply)` block is the case this must *not* touch —
+adjacent option rows whose mappings genuinely differ per option.
+
+`annotate.py` never groups anything itself. Grouping is a decision, it is
+visible in the sheet, and a reviewer signed off on the sheet; re-deriving it at
+render time would put a box on the artifact nobody reviewed.
+
+A group may span pages — the repeating-form case — and renders as one box per
+page, because a page annotated only by a box on the previous page is unreadable
+on its own and unreviewable printed. A group may **not** straddle a row carrying
+a different annotation; `to_annotations` refuses, naming the spreadsheet lines.
+
+Placement centres the box on the block and clears the block's **question
+halves**, not its widest anchor: the option rows in that example are
+option-*only* rows, so their anchor is the response bbox over on the right, and
+clearing that would put the box past the options instead of in the gutter.
+`--brackets` draws the `[` spanning the covered rows; it is off in the artifact
+(the guidelines' examples show a plain centred box) and on in `qc_preview.pdf`,
+where "did it group the right rows?" is the question being asked.
+
 ## MSG v2.0 styling
 
 Annotation text sits in a coloured box, black on the fill, with a legend at the
@@ -243,6 +297,18 @@ carry no information; the older convention (red text for a mapping, grey for a
 note, a border for a banner) has to be checked last or it inverts the
 classification completely.
 
+**A grouped mark comes back as a mapping per covered row.** `place_group` is
+inverted the same way `place_row` is — is this mark centred on a run of
+consecutive rows, just past the widest of them? — and one box covering five rows
+becomes five records sharing a bbox, each keyed on its own row's text. Without
+it the box attaches to whichever single row its centre sits nearest, and the
+corpus learns the mapping for that row while forgetting it for the other four: a
+wrong answer with a plausible `match_distance`. Inverting a *set* is
+under-determined (a longer symmetric run containing the same widest row produces
+the same two numbers), so the smallest matching run wins — the same bias
+`_merge_wrapped` applies, for the same reason: under-claiming is recoverable and
+over-claiming is invisible.
+
 And because MSG annotations carry no domain prefix, the domain is recovered from
 the **page legend's colour key** (`legend_color_map`) — an explicit assertion
 printed on the page that this colour means this domain, ranked above the
@@ -343,6 +409,7 @@ pipeline/
   msg.py              MSG v2.0 palette, per-form domain encounter order
   corpus_precedent.py mines prior aCRFs; pre-populates from what it mined
   control_sheet.py    the XLSX a human reviews -- the Part 11 artifact
+  grouping.py         one annotation covering several rows (repeating blocks)
   layout.py           gutter placement (arithmetic, not search)
   render.py           shared drawing helper: fills, dashes, legend
   stamp.py            QC stamping from in-memory records (pre-review)

@@ -215,3 +215,63 @@ def test_unmapped_rows_are_visibly_marked_in_the_final_pdf(crfs, placed, tmp_pat
     final = xfdf_to_pdf(crfs["acroform"], xfdf_path, tmp_path / "final.pdf")
     contents = {c for c, _ in read_annots(final, 0)}
     assert NOT_SUBMITTED_TEXT in contents
+
+
+# --- grouped annotations, end to end ---------------------------------------
+
+
+def test_a_grouped_block_reaches_the_final_pdf_as_one_box(crfs, rowset, tmp_path):
+    """The whole claim, drawn: a block of rows sharing one mapping produces one
+    annotation on the page, not one per row."""
+    from pipeline import control_sheet, grouping
+
+    sheet = control_sheet.write_control_sheet(rowset, tmp_path / "cs.xlsx")
+    block = [r for r in rowset.rows if r.page_index == 0][10:14]
+    _fill_group(sheet, [r.row_id for r in block], "ETHNIC")
+
+    annotations = control_sheet.to_annotations(sheet, rowset)
+    placed = layout.place_annotations(annotations, rowset)
+    assert grouping.summarize(placed) == (1, len(block))
+
+    final = xfdf_to_pdf(
+        crfs["acroform"], xfdf.write_xfdf(placed, tmp_path / "x.xfdf"),
+        tmp_path / "final.pdf",
+    )
+    assert [c for c, _ in read_annots(final, 0)] == ["ETHNIC"]
+
+
+def test_a_grouped_block_is_not_re_asked_of_copilot(crfs, rowset, tmp_path):
+    """Coverage is what the batching reads. Scanning row_id alone would send
+    every member but the anchor off to re-derive a mapping already on the
+    sheet."""
+    from pipeline import control_sheet
+    from pipeline.prompt import rows_needing_annotation
+
+    sheet = control_sheet.write_control_sheet(rowset, tmp_path / "cs.xlsx")
+    block = [r for r in rowset.rows if r.page_index == 0][10:14]
+    _fill_group(sheet, [r.row_id for r in block], "ETHNIC")
+
+    remaining = rows_needing_annotation(
+        rowset, control_sheet.to_annotations(sheet, rowset)
+    )
+    assert not {r.row_id for r in remaining.rows} & {r.row_id for r in block}
+
+
+def _fill_group(sheet_path, row_ids: list[str], text: str) -> None:
+    """Type one mapping and a shared group key, the way a reviewer would."""
+    from openpyxl import load_workbook
+
+    from pipeline.control_sheet import SHEET_NAME
+
+    wb = load_workbook(sheet_path)
+    ws = wb[SHEET_NAME]
+    header = [c.value for c in ws[1]]
+    for row in ws.iter_rows(min_row=2):
+        if row[header.index("row_id")].value not in row_ids:
+            continue
+        row[header.index("group")].value = "g1"
+        row[header.index("review_status")].value = "accepted"
+        row[header.index("reviewed_by")].value = "mgarcia"
+        if row[header.index("row_id")].value == row_ids[0]:
+            row[header.index("anno1")].value = text
+    wb.save(sheet_path)

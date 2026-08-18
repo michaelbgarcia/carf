@@ -23,10 +23,12 @@ from typing import Optional
 
 import pymupdf
 
+from pipeline.layout import block_anchor
 from pipeline.models import AnnotationKind, AnnotationSet, ReviewStatus, RowSet
 from pipeline.msg import apply_colors, page_color_map
 from pipeline.render import (
     draw_annotation,
+    draw_group_bracket,
     draw_legend,
     legend_origin,
     save_with_annotations,
@@ -52,6 +54,7 @@ def stamp_annotations(
     out_path: str | Path,
     rows: Optional[RowSet] = None,
     legend: bool = True,
+    brackets: bool = True,
 ) -> Path:
     """Stamp proposals onto a copy of the blank CRF for visual QC.
 
@@ -59,6 +62,13 @@ def stamp_annotations(
     coloured. Without it there is no form grouping to assign MSG colours by, so
     the preview falls back to uncoloured marks -- readable, but not a preview of
     what the deliverable will look like.
+
+    ``brackets`` defaults **on** here and off in ``scripts/annotate.py``, which
+    is a deliberate split rather than an inconsistency. The question a reviewer
+    asks of this file is "did it group the right rows?", and a bracket answers
+    it directly; the question asked of the artifact is what the guidelines'
+    examples answer, which is a plain centred box. It is the same reason this
+    file carries a banner and the artifact does not.
     """
     if rows is not None:
         annotations = apply_colors(annotations, rows)
@@ -85,6 +95,14 @@ def stamp_annotations(
             )
             drawn += 1
             suggested += bool(annot.suggested)
+            if brackets and annot.is_grouped and rows is not None:
+                members = [
+                    r for r in (rows.by_id(m) for m in annot.covered_row_ids) if r is not None
+                ]
+                if members:
+                    draw_group_bracket(
+                        doc[annot.page_index], block_anchor(members), annot.bbox
+                    )
 
         if legend:
             for page_index, colors in by_page.items():

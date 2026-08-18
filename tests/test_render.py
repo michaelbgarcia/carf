@@ -18,6 +18,7 @@ from pipeline.render import (
     BORDER_WIDTH,
     DASH_PATTERN,
     draw_annotation,
+    draw_group_bracket,
     draw_legend,
     save_with_annotations,
 )
@@ -157,6 +158,42 @@ def test_legend_wraps_onto_a_second_line_when_it_runs_out_of_width(page):
 
 def test_empty_legend_draws_nothing(page):
     assert draw_legend(page, []) == []
+
+
+def test_group_bracket_spans_the_block_and_stays_left_of_the_box(page):
+    """The bracket is what states which rows one box covers, so its span is the
+    block's -- not the box's, which is a single line tall."""
+    block = BBox(x0=90.0, y0=560.0, x1=250.0, y1=620.0)
+    box = _bbox(y0=584.0)
+
+    annot = draw_group_bracket(page, block, box)
+
+    h = page.rect.height
+    assert annot.type[1] == "PolyLine"
+    assert annot.rect.y0 <= h - block.y1 + 1.0
+    assert annot.rect.y1 >= h - block.y0 - 1.0
+    assert annot.rect.x1 <= box.x0 + 1.0
+
+
+def test_group_bracket_is_markup_not_page_content(page, tmp_path):
+    """Same rule the box follows: drawing it into the content stream would edit
+    the blank CRF itself."""
+    block = BBox(x0=90.0, y0=560.0, x1=250.0, y1=620.0)
+    draw_group_bracket(page, block, _bbox(y0=584.0))
+    out = tmp_path / "bracketed.pdf"
+    save_with_annotations(page.parent, out)
+
+    doc = pymupdf.open(out)
+    try:
+        assert [a.type[1] for a in doc[0].annots()] == ["PolyLine"]
+    finally:
+        doc.close()
+
+
+def test_no_bracket_when_the_box_is_left_of_the_block(page):
+    """Nothing to bracket: the geometry says the box is not beside this block."""
+    block = BBox(x0=90.0, y0=560.0, x1=500.0, y1=620.0)
+    assert draw_group_bracket(page, block, _bbox(y0=584.0)) is None
 
 
 def test_save_does_not_flatten_annotations(page, tmp_path):

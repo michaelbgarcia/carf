@@ -460,6 +460,81 @@ def test_mark_beside_a_question_matches_it_not_the_option_row_below(crfs, tmp_pa
     assert variable.label == question.text_1
 
 
+# --- grouped (repeating) annotations ----------------------------------------
+
+
+def test_one_grouped_box_comes_back_as_a_mapping_for_every_row_it_covered(
+    crfs, tmp_path
+):
+    """The reverse of the whole point of grouping.
+
+    Without this, one box covering five rows returns attached to whichever row
+    its centre sits nearest, and the corpus learns the mapping for that row's
+    text while forgetting it for the other four -- a wrong answer carrying a
+    plausible ``match_distance``, which is worse than no answer.
+    """
+    rowset = extract_rows(crfs["acroform"])
+    question = next(
+        r for r in rowset.rows if r.text_1.startswith("Was this participant a prior")
+    )
+    # The question row plus the two rows under it: the question is the widest,
+    # which is the ordinary shape of a question-and-options block.
+    start = next(i for i, r in enumerate(rowset.rows) if r.row_id == question.row_id)
+    block = rowset.rows[start : start + 3]
+    assert len({r.page_index for r in block}) == 1
+    assert layout.block_anchor(block).x1 == question.anchor.x1
+
+    text = 'SUPPDM.QVAL when QNAM="RESCREEN"'
+    (box,) = layout.place_group(layout.block_anchor(block), [text])
+
+    doc = pymupdf.open(crfs["acroform"])
+    page = doc[question.page_index]
+    draw_annotation(page, box, text)
+    out = tmp_path / "grouped.pdf"
+    save_with_annotations(doc, out)
+    doc.close()
+
+    mappings = [
+        m for m in parse_annotated_pdf(out, crfs["acroform"]) if m.kind == "variable"
+    ]
+
+    assert [m.row_id for m in mappings] == [r.row_id for r in block]
+    # ...and every one of them still says it came from a single drawn box.
+    for m in mappings:
+        assert m.member_row_ids == [r.row_id for r in block]
+        assert m.variable == "SUPPDM.QVAL" or m.text == text
+
+
+def test_a_single_row_mark_is_not_read_as_a_group(crfs, tmp_path):
+    """The false positive that would matter: a group match ranked ahead of an
+    exact single-row hit would spread one row's mapping across its neighbours."""
+    rowset = extract_rows(crfs["acroform"])
+    question = next(
+        r for r in rowset.rows if r.text_1.startswith("Was this participant a prior")
+    )
+    page_geom = rowset.pages[question.page_index]
+    (box,) = layout.place_row(
+        question.anchor,
+        ["RESCREEN"],
+        page_geom,
+        limit=layout.right_limit(question, page_geom),
+        obstacles=[],
+    )
+
+    doc = pymupdf.open(crfs["acroform"])
+    draw_annotation(doc[question.page_index], box, "RESCREEN")
+    out = tmp_path / "single.pdf"
+    save_with_annotations(doc, out)
+    doc.close()
+
+    variables = [
+        m for m in parse_annotated_pdf(out, crfs["acroform"]) if m.kind == "variable"
+    ]
+    assert len(variables) == 1
+    assert variables[0].row_id == question.row_id
+    assert variables[0].member_row_ids == []
+
+
 # --- full-loop round trip: this pipeline's own convention, end to end -------
 
 

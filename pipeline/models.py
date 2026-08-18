@@ -402,6 +402,12 @@ class SdtmAnnotation(BaseModel):
     ``row_id`` is nullable so page-level domain legend banners (which belong to
     the page, not to any one row) can be represented here too.
 
+    One annotation can cover **several rows** -- see ``group_id`` and
+    ``member_row_ids``, and ``pipeline/grouping.py`` for the rules. ``row_id``
+    stays the anchor (the first member in document order) so every join,
+    lookup and colour decision that already keys on it keeps working
+    unchanged; the group is additional information, not a different shape.
+
     ``text`` and the structured fields both exist, and which one wins is a
     deliberate rule rather than an oversight: **``text`` is authoritative for
     rendering whenever it is set.** The control sheet's ``anno1`` / ``anno2``
@@ -432,6 +438,24 @@ class SdtmAnnotation(BaseModel):
     fixed_value: Optional[str] = None
     codelist: Optional[str] = None
     origin: Optional[Origin] = None
+
+    # Grouping (one annotation, many rows)
+    group_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Key shared by every row this annotation covers. Typed by a reviewer "
+            "in the control sheet's `group` column, or assigned by "
+            "pipeline.grouping when identical annotations were collapsed."
+        ),
+    )
+    member_row_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Every row covered, in document order, `row_id` first. Empty on an "
+            "ordinary single-row annotation -- use `covered_row_ids`, which "
+            "normalises the two cases."
+        ),
+    )
 
     # Presentation (Metadata Submission Guidelines v2.0)
     color: Optional[tuple[int, int, int]] = Field(
@@ -485,10 +509,58 @@ class SdtmAnnotation(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _check_group(self) -> "SdtmAnnotation":
+        """The anchor leads its own membership list, and nothing repeats.
+
+        Both rules exist because the anchor is what every other step keys on.
+        A ``member_row_ids`` that does not start with ``row_id`` would mean the
+        box is positioned against one row and attributed to another; a repeated
+        member would double-count the same row in coverage reporting and mine
+        the same precedent entry twice.
+        """
+        if not self.member_row_ids:
+            return self
+        if self.row_id is None:
+            raise ValueError(
+                f"annotation {self.annot_id!r} has member_row_ids but no row_id; "
+                "a group is anchored on its first member, which must also be row_id"
+            )
+        if self.member_row_ids[0] != self.row_id:
+            raise ValueError(
+                f"annotation {self.annot_id!r}: member_row_ids[0] is "
+                f"{self.member_row_ids[0]!r} but row_id is {self.row_id!r}; the "
+                "anchor row must lead its own group, since placement uses row_id"
+            )
+        if len(set(self.member_row_ids)) != len(self.member_row_ids):
+            raise ValueError(
+                f"annotation {self.annot_id!r} lists a row twice in member_row_ids: "
+                f"{self.member_row_ids}"
+            )
+        return self
+
     @property
     def display_page(self) -> int:
         """1-based page number, for humans only. Never write this to XFDF."""
         return self.page_index + 1
+
+    @property
+    def covered_row_ids(self) -> list[str]:
+        """Every row this annotation asserts a mapping for, grouped or not.
+
+        The one accessor callers should use when they mean "which rows does
+        this cover" -- coverage reporting, precedent mining, "is this row still
+        unmapped". Reading ``row_id`` alone answers that question wrongly for a
+        group, silently, by under-counting the members.
+        """
+        if self.member_row_ids:
+            return list(self.member_row_ids)
+        return [self.row_id] if self.row_id else []
+
+    @property
+    def is_grouped(self) -> bool:
+        """Whether one drawn box stands in for an annotation on several rows."""
+        return len(self.member_row_ids) > 1
 
     def label_text(self) -> str:
         """The SDTM mapping composed from the structured fields.

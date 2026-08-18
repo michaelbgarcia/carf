@@ -134,6 +134,32 @@ def test_provenance_survives_in_the_carf_namespace(tmp_path):
     assert meta["review_status"] == "proposed"
 
 
+def test_group_membership_survives_in_the_carf_namespace(tmp_path):
+    """A grouped annotation is one box asserting a mapping for several rows.
+    The rect cannot say which rows, and Acrobat has no concept to map it onto,
+    so our own namespace is the only place a round trip can recover it from."""
+    path = write_xfdf(
+        _set(
+            _annot(
+                row_id="p1_r001",
+                group_id="g1",
+                member_row_ids=["p1_r001", "p1_r002", "p1_r003"],
+            )
+        ),
+        tmp_path / "x.xfdf",
+    )
+    meta = parse_xfdf(path)[0].meta
+    assert meta["group_id"] == "g1"
+    assert meta["member_row_ids"] == "p1_r001 p1_r002 p1_r003"
+
+
+def test_an_ungrouped_annotation_carries_no_group_metadata(tmp_path):
+    path = write_xfdf(_set(_annot()), tmp_path / "x.xfdf")
+    meta = parse_xfdf(path)[0].meta
+    assert "group_id" not in meta
+    assert "member_row_ids" not in meta
+
+
 def test_source_model_is_recorded_as_the_annotation_author():
     """Provenance goes in @title, whichever step produced the annotation.
 
