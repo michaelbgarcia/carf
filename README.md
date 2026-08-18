@@ -63,9 +63,12 @@ the only PDF engine — see "Why not PDFminer or PIL" below.
 ## The flow
 
 ```
+                    scripts/mine_corpus.py  (once, per corpus)
+dir of prior aCRFs  ────────────────────────────►  build/corpus_lookup.csv
+
                     scripts/build_sheet.py
 blank_crf.pdf  ─────────────────────────────────►  build/rows.json
-corpus_lookup.csv                                  build/proposals.json
+build/corpus_lookup.csv                            build/proposals.json
                                                    build/control_sheet.xlsx
                                                    build/qc_preview.pdf
 
@@ -89,18 +92,28 @@ a real CRF or a Copilot session.
 **Mined corpus precedent, first.** `parse_annotated_pdf.py` recovers mappings
 from a *finished* aCRF, and `corpus_precedent.py` runs that across a directory
 of them and consolidates the result into a `question text → domain/variable/
-condition` table with a support count. That table plays the role a metadata
-repository would, and it is keyed the same way: CRF question text matched
-against standard text held elsewhere.
+condition` table with a support count. `scripts/mine_corpus.py` is what writes
+that table, to `build/corpus_lookup.csv` — it is the only thing that produces
+the file, and it is a standalone tool, not a pipeline step: run it once per
+corpus, not once per CRF. That table plays the role a metadata repository
+would, and it is keyed the same way: CRF question text matched against
+standard text held elsewhere.
 
 Everything it fills in is marked `suggested`, which the control sheet renders as
 a **grey cell** — so "mined from 7 prior CRFs" never looks like "a person
 decided this".
 
 ```bash
-python scripts/mine_corpus.py <dir-of-annotated-crfs> --blank-dir <dir-of-blanks>
+# once per corpus -- writes build/corpus_lookup.csv
+python scripts/mine_corpus.py <dir-of-annotated-crfs> --blank-dir <dir-of-blanks> \
+    -o build/corpus_lookup.csv
+# then, per CRF
 python scripts/build_sheet.py blank_crf.pdf --precedent build/corpus_lookup.csv
 ```
+
+With no corpus of prior aCRFs there is no lookup table and nothing to
+pre-populate from; `build_sheet.py` without `--precedent` just writes an empty
+control sheet for a human to fill.
 
 **Copilot 365 chat, only for the gaps.** There is no programmatic LLM access
 here; the only model available is Copilot 365 chat, driven by a person pasting

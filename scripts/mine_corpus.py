@@ -13,11 +13,12 @@ The output CSV is meant for two downstream uses: pass it to
 ``attribute_domains(..., precedent=...)`` (or `pipeline.parse_annotated_pdf.
 parse_annotated_pdf(..., precedent=...)`) as a fallback for pages with no
 local domain banner, and/or pass it to `scripts/build_sheet.py
---precedent-csv` to give Copilot real historical precedent in its
-instructions.
+--precedent` to pre-populate a control sheet (and to give Copilot real
+historical precedent in the instructions for whatever it cannot answer).
 
 Usage:
-    python scripts/mine_corpus.py <pdf_dir> [--blank-dir dir] [--min-support N] -o lookup.csv
+    python scripts/mine_corpus.py <pdf_dir> [--blank-dir dir] [--min-support N]
+        [-o build/corpus_lookup.csv]
 """
 
 from __future__ import annotations
@@ -37,6 +38,10 @@ from pipeline.corpus_precedent import (  # noqa: E402
 )
 from pipeline.parse_annotated_pdf import DEFAULT_MAX_MATCH_DISTANCE  # noqa: E402
 
+#: Where build_sheet.py --precedent expects to find the table, so the two
+#: scripts agree on a path without the caller having to name it twice.
+DEFAULT_LOOKUP_PATH = Path("build/corpus_lookup.csv")
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -50,7 +55,10 @@ def main(argv: list[str] | None = None) -> int:
         "--min-support", type=int, default=DEFAULT_MIN_SUPPORT,
         help="corroborating occurrences required before a variable's domain becomes precedent",
     )
-    parser.add_argument("-o", "--out", type=Path, required=True, help="write the corpus lookup table here as CSV")
+    parser.add_argument(
+        "-o", "--out", type=Path, default=DEFAULT_LOOKUP_PATH,
+        help=f"write the corpus lookup table here as CSV (default {DEFAULT_LOOKUP_PATH})",
+    )
     args = parser.parse_args(argv)
 
     mappings = mine_corpus(args.pdf_dir, args.blank_dir, args.max_distance, args.min_support)
