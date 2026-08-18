@@ -89,8 +89,8 @@ def main(argv: list[str] | None = None) -> int:
     by_kind: dict[str, int] = {}
     for m in mappings:
         by_kind[m.kind] = by_kind.get(m.kind, 0) + 1
-    matched = [m for m in mappings if m.kind != "domain" and m.field_id is not None]
-    unmatched = [m for m in mappings if m.kind != "domain" and m.field_id is None]
+    matched = [m for m in mappings if m.kind != "domain" and m.row_id is not None]
+    unmatched = [m for m in mappings if m.kind != "domain" and m.row_id is None]
     inferred = [m for m in mappings if m.domain_inferred]
 
     print(f"{args.pdf.name}: {len(mappings)} annotation(s) found")

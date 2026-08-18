@@ -1,6 +1,10 @@
 """Parses a pasted/attached Copilot 365 spec-sheet reply back into annotations.
 
-Task order step 5 (redesigned; see README "Batches, not pages").
+Only reached for rows mined precedent could not answer -- see ``prompt.py`` on
+Copilot being the gap filler rather than the mapping source. That demotion is
+why the warning at the bottom of this docstring is no longer a risk to the whole
+document: a batch that comes back unparseable now costs a retry on a handful of
+rows instead of blocking the artifact.
 
 The input is a filled-in copy of the CSV spec sheet ``prompt.py`` generated,
 returned either as pasted text in the chat or as a downloaded attachment --
@@ -9,7 +13,7 @@ payload, so expect the same category of mangling as before, plus one new,
 CSV-specific one:
 
 * **Markdown-table reformatting.** Chat UIs have a strong habit of rendering
-  tabular data back as a markdown table (``| field_id | domain | ... |`` with
+  tabular data back as a markdown table (``| row_id | domain | ... |`` with
   a ``|---|---|`` header-separator row) rather than literal CSV, because
   that's idiomatic for a chat reply. The instructions explicitly ask for CSV;
   this parser expects the markdown table anyway and treats it as the primary
@@ -31,16 +35,17 @@ Two rules govern everything here, unchanged from the original design:
 * **Everything is a proposal.** This module sets ``review_status=PROPOSED``
   and nothing else, ever.
 
-The join key is ``field_id``, not a row position -- see ``prompt.py``. Rows
-are matched by id via ``FieldSet.by_id``, which means row reordering, missing
-rows, and rows from the wrong batch are all detectable rather than silently
-misattributed the way a positional join would be.
+The join key is ``row_id``, not a row position -- see ``prompt.py``. Rows are
+matched by id via ``RowSet.by_id``, which means row reordering, missing rows, and
+rows from the wrong batch are all detectable rather than silently misattributed
+the way a positional join would be.
 
 .. warning::
    Like the JSON design before it, this has not been exercised against a real
    Copilot 365 reply. The recovery steps are built from known chat-UI
-   behaviours, not from an observed response -- see README "The one manual
-   step". Treat the quirk list above as provisional.
+   behaviours, not from an observed response. Treat the quirk list above as
+   provisional -- but note this is now an optional side path, not a gate on
+   producing an annotated CRF.
 """
 
 from __future__ import annotations
@@ -55,8 +60,8 @@ from typing import Optional
 from pipeline.models import (
     AnnotationSet,
     CopilotProposal,
-    FieldSet,
     ReviewStatus,
+    RowSet,
     SdtmAnnotation,
 )
 
@@ -77,7 +82,7 @@ _MD_SEPARATOR = re.compile(r"^\s*\|?[\s:|-]+\|?\s*$")
 # Matches the header row in CSV, TSV, or semicolon-delimited form, optionally
 # quoted -- used to locate the table inside surrounding chat prose, the same
 # way the old JSON parser located the array by its first '[' and last ']'.
-_HEADER_LINE = re.compile(r"^\s*[\"']?field_id[\"']?\s*[,\t;]", re.IGNORECASE)
+_HEADER_LINE = re.compile(r"^\s*[\"']?row_id[\"']?\s*[,\t;]", re.IGNORECASE)
 _NULLISH = {"", "null", "none", "n/a", "na", "not applicable", "-"}
 
 
@@ -96,7 +101,7 @@ class ResponseParseError(ValueError):
 
 
 class IncompleteResponseError(ResponseParseError):
-    """The reply parsed but does not cover every field it should have."""
+    """The reply parsed but does not cover every row it should have."""
 
     def __init__(self, message: str, raw_text: str, missing: list[str]) -> None:
         super().__init__(message, raw_text)
@@ -146,7 +151,7 @@ def _parse_markdown_table(block: list[str]) -> list[dict[str, str]]:
     one in a rationale sentence, say) silently shifts every column after it
     -- the row still parses, just with the wrong values in the wrong fields,
     and pydantic validation on the shifted result does not reliably catch it
-    (an enum field landing on a stray field_id-shaped string does; two
+    (an enum field landing on a stray row_id-shaped string does; two
     strings swapping between two free-text columns does not). Checking the
     cell count against the header here converts that from a silent
     misattribution into a loud failure, regardless of whether the shifted
@@ -243,7 +248,7 @@ def parse_sheet_rows(text: str) -> list[dict[str, str]]:
     if csv_block is None:
         raise ResponseParseError(
             "no recognizable table found in the response -- expected either a "
-            "markdown table or a CSV/TSV block with a field_id header column",
+            "markdown table or a CSV/TSV block with a row_id header column",
             text,
         )
 
@@ -255,7 +260,7 @@ def parse_sheet_rows(text: str) -> list[dict[str, str]]:
     if not rows:
         raise ResponseParseError(
             "parsed the response but found no data rows -- expected a CSV header "
-            "row followed by one row per field",
+            "row followed by one row per CRF row",
             text,
         )
     return rows
@@ -275,10 +280,16 @@ def parse_proposals(text: str) -> list[CopilotProposal]:
     Once ``parse_sheet_rows`` has isolated the table from surrounding prose,
     every row that reaches here is expected to be real data -- so any row
     that still fails to validate is a genuine defect (a mistyped confidence,
-    a dropped field_id) and raises rather than being silently excluded. A
+    a dropped row_id) and raises rather than being silently excluded. A
     reply that is mostly right except for one bad row should come back to the
-    human for a fix, not ship 30 of 31 annotations with no signal that one
+    human for a fix, not ship most of the annotations with no signal that one
     went missing.
+
+    A filled-in ``variable2`` cell yields a *second* proposal on the same
+    ``row_id`` at ``slot=2`` -- the AGE / AGEU case, where one printed line
+    carries two variables. Expanding it here rather than asking for a second
+    sheet row is what keeps "one row in, one row out" true of the reply, which
+    is the property the row_id join relies on.
     """
     rows = parse_sheet_rows(text)
 
@@ -286,18 +297,42 @@ def parse_proposals(text: str) -> list[CopilotProposal]:
     errors: list[str] = []
     for i, row in enumerate(rows, start=1):
         scrubbed = _scrub(row)
-        if not scrubbed.get("field_id"):
-            errors.append(f"row {i}: missing field_id")
+        if not scrubbed.get("row_id"):
+            errors.append(f"row {i}: missing row_id")
             continue
         try:
-            proposals.append(CopilotProposal.model_validate(scrubbed))
+            first = CopilotProposal.model_validate({**scrubbed, "slot": 1})
         except Exception as exc:  # pydantic ValidationError
-            errors.append(f"row {i} ({scrubbed.get('field_id')}): {exc}")
+            errors.append(f"row {i} ({scrubbed.get('row_id')}): {exc}")
+            continue
+        proposals.append(first)
+
+        second = scrubbed.get("variable2")
+        if not second:
+            continue
+        try:
+            proposals.append(
+                CopilotProposal.model_validate(
+                    {
+                        **scrubbed,
+                        "slot": 2,
+                        "variable": second,
+                        # A second variable on the same line is a separate
+                        # mapping, not a qualified form of the first: AGEU is not
+                        # "AGE when something". Carrying the first's condition
+                        # over would attach a where-clause nobody asked for.
+                        "condition": None,
+                        "rationale": None,
+                    }
+                )
+            )
+        except Exception as exc:  # pydantic ValidationError
+            errors.append(f"row {i} ({scrubbed.get('row_id')}) variable2: {exc}")
 
     if errors:
         raise ResponseParseError(
-            f"{len(errors)} of {len(rows)} row(s) in the response failed to "
-            "parse:\n" + "\n".join(errors),
+            f"{len(errors)} problem(s) across {len(rows)} row(s) in the response:\n"
+            + "\n".join(errors),
             text,
         )
     return proposals
@@ -305,41 +340,51 @@ def parse_proposals(text: str) -> list[CopilotProposal]:
 
 def attach_geometry(
     proposals: list[CopilotProposal],
-    fieldset: FieldSet,
+    rows: RowSet,
 ) -> list[SdtmAnnotation]:
-    """Rejoin proposals to their source fields by field_id and fill in provenance."""
+    """Rejoin proposals to their source rows by ``row_id`` and fill in provenance.
+
+    The bbox each annotation gets is its row's own anchor;
+    ``layout.place_annotations`` moves it into the gutter afterwards. Positioning
+    here would bake placement into the parse step.
+    """
     now = datetime.now(timezone.utc)
-    seen: dict[str, int] = {}
+    seen: dict[tuple[str, int], int] = {}
     out: list[SdtmAnnotation] = []
 
     for p in proposals:
-        field = fieldset.by_id(p.field_id)
-        if field is None:
+        row = rows.by_id(p.row_id)
+        if row is None:
             raise ResponseParseError(
-                f"field_id {p.field_id!r} is not in this document's field set -- "
+                f"row_id {p.row_id!r} is not in this document's row set -- "
                 f"the reply may have been pasted against the wrong batch, or a "
-                f"row's field_id was altered in the reply",
-                p.field_id,
+                f"row's row_id was altered in the reply",
+                p.row_id,
             )
-        seen[p.field_id] = seen.get(p.field_id, 0) + 1
-        suffix = "" if seen[p.field_id] == 1 else f"-{seen[p.field_id]}"
+        key = (p.row_id, p.slot)
+        seen[key] = seen.get(key, 0) + 1
+        suffix = "" if seen[key] == 1 else f"-{seen[key]}"
         out.append(
             SdtmAnnotation(
-                annot_id=f"{field.field_id}{suffix}",
-                field_id=field.field_id,
-                page_index=field.page_index,
-                bbox=field.bbox,
+                annot_id=f"{row.row_id}_a{p.slot}{suffix}",
+                row_id=row.row_id,
+                slot=p.slot,
+                page_index=row.page_index,
+                bbox=row.anchor,
                 kind=p.kind,
                 domain=p.domain,
                 variable=p.variable,
                 condition=p.condition,
+                fixed_value=p.fixed_value,
                 codelist=p.codelist,
                 origin=p.origin,
                 confidence=p.confidence,
                 rationale=p.rationale,
-                # Provenance. Everything Copilot touches enters as a proposal;
-                # the GxP audit trail needs to show a human pasted it.
+                # Provenance. Everything Copilot touches enters as a proposal, and
+                # as a *suggestion* -- so the control sheet greys it and a
+                # reviewer can tell it apart from something a person decided.
                 source_model=SOURCE_MODEL,
+                suggested=True,
                 review_status=ReviewStatus.PROPOSED,
                 reviewed_by=None,
                 created_at=now,
@@ -350,7 +395,7 @@ def attach_geometry(
 
 def ingest_response_file(
     response_path: str | Path,
-    fieldset: FieldSet,
+    rows: RowSet,
     page_indexes: list[int],
     allow_partial: bool = False,
 ) -> AnnotationSet:
@@ -358,7 +403,13 @@ def ingest_response_file(
 
     ``page_indexes`` is the batch's own page list (from the manifest
     ``write_batches`` returned), used only to check completeness -- geometry
-    itself comes from ``field_id``, not from the caller.
+    itself comes from ``row_id``, not from the caller.
+
+    Note the ``rows`` passed here must be the same ``RowSet`` the batch was built
+    from. When batches were narrowed to unanswered rows
+    (``prompt.rows_needing_annotation``), pass that narrowed set: the
+    completeness check compares against every row on the batch's pages, and the
+    full set would report every pre-populated row as missing from the reply.
     """
     path = Path(response_path)
     raw = path.read_text(encoding="utf-8")
@@ -367,22 +418,22 @@ def ingest_response_file(
     except ResponseParseError as exc:
         raise ResponseParseError(f"{path}: {exc}", raw) from exc
 
-    annotations = attach_geometry(proposals, fieldset)
+    annotations = attach_geometry(proposals, rows)
 
-    expected = {f.field_id for f in fieldset.for_pages(page_indexes)}
-    missing = sorted(expected - {p.field_id for p in proposals})
+    expected = {r.row_id for r in rows.for_pages(page_indexes)}
+    missing = sorted(expected - {p.row_id for p in proposals})
     if missing and not allow_partial:
         raise IncompleteResponseError(
             f"{path}: the reply covers {len(expected) - len(missing)} of "
-            f"{len(expected)} fields in this batch; missing field_id(s) "
+            f"{len(expected)} rows in this batch; missing row_id(s) "
             f"{missing}. Re-paste the instructions and sheet and ask for the "
             f"remaining rows, or pass allow_partial to accept a short reply.",
             raw,
             missing,
         )
 
-    pages = [p for p in fieldset.pages if p.page_index in set(page_indexes)]
-    return AnnotationSet(source_pdf=fieldset.source_pdf, pages=pages, annotations=annotations)
+    pages = [p for p in rows.pages if p.page_index in set(page_indexes)]
+    return AnnotationSet(source_pdf=rows.source_pdf, pages=pages, annotations=annotations)
 
 
 __all__ = [

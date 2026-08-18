@@ -49,7 +49,7 @@ def test_reviewed_annotation_is_valid_once_attributed():
 @pytest.mark.parametrize("spelling", ["Collected", "collected", "COLLECTED"])
 def test_origin_accepts_chat_and_hand_typed_spellings(spelling):
     """Copilot's reply and a hand-edited XFDF are both human-authored input."""
-    assert CopilotProposal(field_id="DM_USUBJID", origin=spelling).origin is Origin.COLLECTED
+    assert CopilotProposal(row_id="DM_USUBJID", origin=spelling).origin is Origin.COLLECTED
     assert _annot(origin=spelling).origin is Origin.COLLECTED
 
 
@@ -65,7 +65,7 @@ def test_origin_still_rejects_values_outside_define_xml():
 
 def test_domain_and_variable_are_normalised_to_uppercase():
     assert _annot(domain="vs", variable="vsorres").variable == "VSORRES"
-    p = CopilotProposal(field_id="VS_SYSBP_RES", domain=" vs ", variable="vsorres")
+    p = CopilotProposal(row_id="VS_SYSBP_RES", domain=" vs ", variable="vsorres")
     assert (p.domain, p.variable) == ("VS", "VSORRES")
 
 
@@ -74,12 +74,12 @@ def test_domain_and_variable_are_normalised_to_uppercase():
 
 def test_proposal_ignores_extra_keys_copilot_invents():
     p = CopilotProposal.model_validate(
-        {"field_id": "DM_AGE", "variable": "AGE", "commentary": "looks like a DM field"}
+        {"row_id": "DM_AGE", "variable": "AGE", "commentary": "looks like a DM field"}
     )
-    assert p.field_id == "DM_AGE" and p.variable == "AGE"
+    assert p.row_id == "DM_AGE" and p.variable == "AGE"
 
 
-def test_proposal_rejects_a_missing_field_id():
+def test_proposal_rejects_a_missing_row_id():
     """Without it there is no way back to a bbox, so this must not pass silently."""
     with pytest.raises(ValidationError):
         CopilotProposal.model_validate({"variable": "AGE"})

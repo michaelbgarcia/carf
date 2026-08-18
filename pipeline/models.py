@@ -1,20 +1,37 @@
 """Typed records for the aCRF annotation pipeline.
 
+The unit of extraction
+----------------------
+A CRF page is treated as **two text columns**: the left column carries the
+question prompt, the right column carries the response option, unit or fixed
+value. The extraction unit is therefore a :class:`CRFRow` -- one printed line
+(or wrapped block) with up to two pieces of text and up to two bboxes -- and
+*not* a detected capture field.
+
+That is a deliberate reversal of the earlier design, which located AcroForm
+widgets, drawn boxes and fill-in-blank underlines and then searched left,
+right and above for whichever printed text seemed to caption each one. Column
+position carries the same information without the search, and it degrades
+better: a text extractor cannot silently omit a line it failed to understand,
+so a row nobody has mapped is visible as an unmapped row rather than absent.
+
 Coordinate convention
 ---------------------
 Every ``BBox`` in this module is in **PDF user space**: bottom-left origin,
-y increasing upward. PyMuPDF's native ``fitz.Rect`` is top-left origin with y
-increasing downward, so a fitz rect is *not* a BBox and must never be handed
+y increasing upward. PyMuPDF's native ``pymupdf.Rect`` is top-left origin with
+y increasing downward, so a fitz rect is *not* a BBox and must never be handed
 to one of these models without going through ``pipeline.geometry``. The
-fitz-native rect exists only transiently inside ``extract.py``.
+fitz-native rect exists only transiently inside ``pipeline.text`` and
+``pipeline.rows``.
 
 Provenance
 ----------
-There is no API model behind these annotations -- a human pastes them out of
-Copilot 365 chat. The provenance fields (``source_model``, ``review_status``,
-``reviewed_by``, timestamps) are therefore load-bearing for the GxP / 21 CFR
-Part 11 audit trail rather than decorative: they are the record that a human
-was in the loop at the annotation step.
+There is no API model behind these annotations. They come from mined corpus
+precedent, from a human typing in the control sheet, or from a person pasting
+Copilot 365 chat output. The provenance fields (``source_model``,
+``review_status``, ``reviewed_by``, timestamps) are therefore load-bearing for
+the GxP / 21 CFR Part 11 audit trail rather than decorative: they are the
+record that a human was in the loop at the annotation step.
 """
 
 from __future__ import annotations
@@ -30,24 +47,30 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+#: What a row deliberately excluded from SDTM is marked with. Upper case per
+#: Metadata Submission Guidelines v2.0. ``parse_annotated_pdf`` matches it
+#: case-insensitively when reading historical aCRFs, which predate any house
+#: convention and use both spellings.
+NOT_SUBMITTED_TEXT = "[NOT SUBMITTED]"
+
+
 # --------------------------------------------------------------------------
 # Enumerations
 # --------------------------------------------------------------------------
 
 
 class AnnotationKind(str, Enum):
-    """What an annotation is asserting about the form."""
+    """What an annotation is asserting about the form.
+
+    ``DOMAIN`` is the page-top legend banner ("DM (Demographics)"), ``VARIABLE``
+    is a mapping drawn in the gutter beside a row, ``NOTE`` is a free-text
+    comment. The three render differently under Metadata Submission Guidelines
+    v2.0 -- see ``pipeline/render.py``.
+    """
 
     DOMAIN = "domain"
     VARIABLE = "variable"
     NOTE = "note"
-
-
-class FieldSource(str, Enum):
-    """How a :class:`CRFField` was detected in the blank CRF."""
-
-    ACROFORM = "acroform"
-    TEXT_LAYOUT = "text_layout"
 
 
 class Origin(str, Enum):
@@ -65,8 +88,9 @@ class Origin(str, Enum):
     def coerce(cls, value: object) -> "Origin":
         """Case-insensitive lookup.
 
-        Copilot is a chat UI, not an API with a constrained decoding grammar;
-        it returns ``"collected"`` or ``"NOT SUBMITTED"`` about as often as the
+        Every entry point for this value is human-typed -- a spreadsheet cell,
+        a hand-edited XFDF, a chat reply pasted out of Copilot. All of them
+        produce ``"collected"`` or ``"NOT SUBMITTED"`` about as often as the
         canonical spelling. Normalising here keeps that leniency in one place.
         """
         if isinstance(value, cls):
@@ -84,8 +108,9 @@ class Origin(str, Enum):
 class ReviewStatus(str, Enum):
     """Where an annotation sits in the human review workflow.
 
-    Everything Copilot produces enters as ``PROPOSED``. Nothing reaches a
-    submission artifact until a human moves it off that value.
+    Everything that was not typed by a human enters as ``PROPOSED``. Nothing
+    reaches a submission artifact until a human moves it off that value, which
+    now happens in the XLSX control sheet.
     """
 
     PROPOSED = "proposed"
@@ -103,7 +128,7 @@ class BBox(BaseModel):
     """An axis-aligned rectangle in PDF user space (bottom-left origin).
 
     ``y0`` is the bottom edge and ``y1`` the top edge, i.e. ``y1 >= y0``.
-    Constructing one directly from a ``fitz.Rect`` is a bug; use
+    Constructing one directly from a ``pymupdf.Rect`` is a bug; use
     ``pipeline.geometry.fitz_rect_to_bbox``.
     """
 
@@ -138,15 +163,24 @@ class BBox(BaseModel):
 
 
 class PageGeometry(BaseModel):
-    """Page dimensions, kept so downstream steps can flip coordinates.
+    """Page dimensions plus the detected column gutter.
 
     ``height`` is what both directions of the y-flip are measured against.
+
+    ``gutter_x`` is the x coordinate separating the question column from the
+    response column, in PDF user space (x is unaffected by the y-flip, so it
+    needs no conversion). ``None`` means this page is single-column -- a title
+    or instruction page -- which is a valid outcome and not an error. It is
+    stored rather than recomputed so it is inspectable in ``rows.json`` and
+    directly assertable in tests, instead of being an invisible intermediate
+    that can only be debugged through its downstream effects.
     """
 
     page_index: int = Field(ge=0, description="0-based; add 1 only when showing a human")
     width: float
     height: float
     rotation: int = 0
+    gutter_x: Optional[float] = None
 
 
 # --------------------------------------------------------------------------
@@ -154,64 +188,122 @@ class PageGeometry(BaseModel):
 # --------------------------------------------------------------------------
 
 
-class CRFField(BaseModel):
-    """One capture field detected on the blank CRF."""
+class CRFRow(BaseModel):
+    """One printed line of a CRF, split across the two text columns.
 
-    field_id: str = Field(description="Stable id, unique across the document")
+    Mirrors the row shape the extraction step produces: page, form, ``text_1``
+    with ``bbox_1``, ``text_2`` with ``bbox_2``.
+
+    Both halves are optional, and each absence means something different:
+
+    * ``text_2`` empty -- a question with a fill-in blank or a widget and no
+      printed response text ("Year of Birth (yyyy)").
+    * ``text_1`` empty -- a continuation option under the question above it
+      ("Female" following "Sex ... Male"). Common, and the reason rows are not
+      required to have a left half.
+
+    ``full_width`` marks a run that crosses the gutter -- a page header, a
+    footer, or a spanning instruction note. Those are excluded from gutter
+    detection (they would erase the corridor they cross) but kept as rows,
+    because a spanning note is frequently the thing that needs annotating.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    row_id: str = Field(description="Stable id, unique across the document")
     page_index: int = Field(ge=0, description="0-based")
-    bbox: BBox
-    label: str = Field(description="Nearest caption text for the field")
-    source: FieldSource
-    context: str = Field(
-        default="",
-        description="Surrounding text, given to Copilot for disambiguation",
-    )
-    acroform_name: Optional[str] = Field(
-        default=None, description="AcroForm /T value when source is acroform"
-    )
-    group_id: Optional[str] = Field(
-        default=None,
-        description=(
-            "Set when this field is one option in a shared checkbox/radio "
-            "question (e.g. a Yes/No/Not Applicable row) -- fields sharing a "
-            "group_id answer the same question and may be annotated as a "
-            "group rather than individually."
-        ),
+    form: str = Field(default="", description="Form name from the page header, if any")
+    text_1: str = Field(default="", description="Question column text")
+    text_2: str = Field(default="", description="Response column text")
+    bbox_1: Optional[BBox] = None
+    bbox_2: Optional[BBox] = None
+    full_width: bool = Field(
+        default=False, description="Run crosses the gutter (header, footer, spanning note)"
     )
 
+    @model_validator(mode="after")
+    def _check_has_content(self) -> "CRFRow":
+        if self.bbox_1 is None and self.bbox_2 is None:
+            raise ValueError(
+                f"row {self.row_id!r} has neither bbox_1 nor bbox_2; a row with no "
+                "geometry cannot be annotated or reviewed and should not have been emitted"
+            )
+        if self.bbox_1 is not None and not self.text_1:
+            raise ValueError(f"row {self.row_id!r} has bbox_1 but no text_1")
+        if self.bbox_2 is not None and not self.text_2:
+            raise ValueError(f"row {self.row_id!r} has bbox_2 but no text_2")
+        return self
 
-class FieldSet(BaseModel):
-    """Everything ``extract.py`` writes to ``build/fields.json``.
+    @property
+    def anchor(self) -> BBox:
+        """The bbox an annotation is positioned against.
 
-    Persisted because ``parse_response.py`` needs the geometry back at ingest
-    time -- the Copilot reply carries no coordinates.
+        ``bbox_1`` when there is a question, otherwise ``bbox_2`` -- an
+        option-only row has nothing else to hang off.
+        """
+        return self.bbox_1 if self.bbox_1 is not None else self.bbox_2  # type: ignore[return-value]
+
+    @property
+    def display_page(self) -> int:
+        """1-based page number, for humans only."""
+        return self.page_index + 1
+
+    def joined_text(self) -> str:
+        """Both columns as one string, for precedent lookup and display."""
+        parts = [p for p in (self.text_1, self.text_2) if p]
+        return " / ".join(parts)
+
+
+class RowSet(BaseModel):
+    """Everything the extraction step writes to ``build/rows.json``.
+
+    Persisted because every later step needs the geometry back, and neither a
+    control sheet nor a Copilot reply carries coordinates.
     """
 
     source_pdf: str
     pages: list[PageGeometry] = Field(default_factory=list)
-    fields: list[CRFField] = Field(default_factory=list)
+    rows: list[CRFRow] = Field(default_factory=list)
     extracted_at: datetime = Field(default_factory=_utcnow)
 
-    def for_page(self, page_index: int) -> list[CRFField]:
-        return [f for f in self.fields if f.page_index == page_index]
+    def for_page(self, page_index: int) -> list[CRFRow]:
+        return [r for r in self.rows if r.page_index == page_index]
 
-    def for_pages(self, page_indexes: Iterable[int]) -> list[CRFField]:
+    def for_pages(self, page_indexes: Iterable[int]) -> list[CRFRow]:
         wanted = set(page_indexes)
-        return [f for f in self.fields if f.page_index in wanted]
+        return [r for r in self.rows if r.page_index in wanted]
 
-    def by_id(self, field_id: str) -> Optional[CRFField]:
-        """Look up a field by its stable id -- the join key for a Copilot reply.
+    def by_id(self, row_id: str) -> Optional[CRFRow]:
+        """Look up a row by its stable id -- the join key for every later step.
 
-        ``field_id`` is already globally unique across the document (see
-        ``extract.py``'s dedup pass), which is what makes it safe as a row
-        identifier in a spec sheet that can span many pages: unlike a
-        page-relative ordinal, it needs no page number alongside it to be
-        unambiguous.
+        ``row_id`` is globally unique across the document, which is what makes
+        it safe as an identifier in a control sheet or spec sheet spanning many
+        pages: unlike a page-relative ordinal, it needs no page number
+        alongside it to be unambiguous, and a reordered or deleted row is still
+        identifiable.
         """
-        for f in self.fields:
-            if f.field_id == field_id:
-                return f
+        for r in self.rows:
+            if r.row_id == row_id:
+                return r
         return None
+
+    def page(self, page_index: int) -> Optional[PageGeometry]:
+        for p in self.pages:
+            if p.page_index == page_index:
+                return p
+        return None
+
+    def forms(self) -> list[str]:
+        """Distinct form names in first-encountered order.
+
+        Order matters: MSG colours are assigned per form by the order domains
+        are first seen, so a stable form order makes the colouring stable.
+        """
+        seen: list[str] = []
+        for r in self.rows:
+            if r.form and r.form not in seen:
+                seen.append(r.form)
+        return seen
 
 
 # --------------------------------------------------------------------------
@@ -225,22 +317,25 @@ class CopilotProposal(BaseModel):
     Mirrors the columns spelled out in the generated instructions: proposal
     columns only, no provenance and no coordinates. ``parse_response.py``
     validates against this first, then builds an :class:`SdtmAnnotation` by
-    joining on ``field_id`` and filling provenance in itself.
+    joining on ``(row_id, slot)`` and filling provenance in itself.
 
-    ``field_id`` -- not a row number -- is the join key. It travels in its own
+    ``row_id`` -- not a row number -- is the join key. It travels in its own
     column on the sheet, already globally unique, so Copilot echoing it back
     unambiguously identifies the row even when a sheet spans many pages and
-    even if rows get reordered in the reply.
+    even if rows get reordered in the reply. ``slot`` distinguishes a second
+    annotation on the same row (the ``AGE`` / ``AGEU`` case) from a duplicate.
     """
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
-    field_id: str = Field(min_length=1, description="Echoed back from the sheet's field_id column")
+    row_id: str = Field(min_length=1, description="Echoed back from the sheet's row_id column")
+    slot: int = Field(default=1, ge=1, le=2)
     kind: AnnotationKind = AnnotationKind.VARIABLE
     domain: Optional[str] = None
     variable: Optional[str] = None
-    condition: Optional[str] = Field(
-        default=None, description='e.g. "VSTESTCD = SYSBP"'
+    condition: Optional[str] = Field(default=None, description='e.g. "VSTESTCD = SYSBP"')
+    fixed_value: Optional[str] = Field(
+        default=None, description='e.g. "PROTOCOL MILESTONE" from "DSCAT = PROTOCOL MILESTONE"'
     )
     codelist: Optional[str] = None
     origin: Optional[Origin] = None
@@ -268,40 +363,71 @@ class CopilotProposal(BaseModel):
 class SdtmAnnotation(BaseModel):
     """A proposed or reviewed SDTM annotation, positioned on the page.
 
-    ``field_id`` is nullable so page-level domain banners (which belong to the
-    page, not to any one capture field) can be represented here too.
+    ``row_id`` is nullable so page-level domain legend banners (which belong to
+    the page, not to any one row) can be represented here too.
+
+    ``text`` and the structured fields both exist, and which one wins is a
+    deliberate rule rather than an oversight: **``text`` is authoritative for
+    rendering whenever it is set.** The control sheet's ``anno1`` / ``anno2``
+    cells are free text, because a human annotator wants to type
+    ``VSORRES when VSTESTCD = SYSBP`` in one cell rather than decompose it
+    across three. That literal string is what gets drawn. The structured
+    fields are parsed off it best-effort (via
+    ``parse_annotated_pdf.parse_mapping_text``) and exist for querying,
+    corpus mining and define.xml reconciliation -- re-deriving the drawn text
+    from them would silently discard a human's exact wording, which is the
+    same mistake ``render.py`` documents avoiding.
     """
 
     annot_id: str
-    field_id: Optional[str] = None
+    row_id: Optional[str] = None
+    slot: int = Field(default=1, ge=1, le=2, description="anno1 or anno2 on the row")
     page_index: int = Field(ge=0, description="0-based")
     bbox: BBox
     kind: AnnotationKind
 
     # Proposal content
+    text: str = Field(
+        default="", description="Literal annotation text; authoritative for rendering"
+    )
     domain: Optional[str] = None
     variable: Optional[str] = None
     condition: Optional[str] = None
+    fixed_value: Optional[str] = None
     codelist: Optional[str] = None
     origin: Optional[Origin] = None
+
+    # Presentation (Metadata Submission Guidelines v2.0)
+    color: Optional[tuple[int, int, int]] = Field(
+        default=None,
+        description="MSG background fill, 0-255 per channel; assigned by pipeline.msg",
+    )
 
     # Provenance / audit trail
     confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     rationale: Optional[str] = None
     source_model: str = Field(
-        default="Copilot 365 chat, manual paste",
-        description="Free text -- there is no API model_id in this pipeline",
+        default="unknown",
+        description="Free text -- e.g. 'mined precedent (n=7)', 'human, control sheet'",
+    )
+    suggested: bool = Field(
+        default=False,
+        description=(
+            "True when this was pre-populated rather than authored by a human. "
+            "Drives the grey fill in the control sheet, so a reviewer can see at "
+            "a glance what still needs looking at."
+        ),
     )
     review_status: ReviewStatus = ReviewStatus.PROPOSED
     reviewed_by: Optional[str] = None
     created_at: datetime = Field(default_factory=_utcnow)
     reviewed_at: Optional[datetime] = None
 
-    # Same leniency as CopilotProposal, because this model has a second
-    # human-authored entry point: xfdf_to_pdf.py reads XFDF that a person may
-    # have hand-edited in Acrobat, and "collected" typed by hand should not be
-    # a hard failure at the last step of the pipeline. The stored value is
-    # still canonical -- only the input spelling is forgiving.
+    # Same leniency as CopilotProposal, because this model has several
+    # human-authored entry points: the XLSX control sheet, and XFDF that a
+    # person may have hand-edited in Acrobat. "collected" typed by hand should
+    # not be a hard failure at the last step of the pipeline. The stored value
+    # is still canonical -- only the input spelling is forgiving.
     @field_validator("domain", "variable", mode="before")
     @classmethod
     def _upper(cls, v: object) -> object:
@@ -329,30 +455,55 @@ class SdtmAnnotation(BaseModel):
         return self.page_index + 1
 
     def label_text(self) -> str:
-        """The SDTM mapping as text, e.g. ``VSORRES when VSTESTCD = SYSBP``.
+        """The SDTM mapping composed from the structured fields.
 
         Empty when the annotation maps to no variable, which is a real case --
-        see :meth:`display_text`.
+        see :meth:`display_text`. Note this is *not* what gets drawn when
+        ``text`` is set; see the class docstring.
         """
         parts = [p for p in (self.domain, self.variable) if p]
-        text = ".".join(parts) if len(parts) == 2 else (parts[0] if parts else "")
+        out = ".".join(parts) if len(parts) == 2 else (parts[0] if parts else "")
+        if self.fixed_value:
+            out = f"{out} = {self.fixed_value}" if out else self.fixed_value
         if self.condition:
-            text = f"{text} when {self.condition}" if text else self.condition
-        return text
+            out = f"{out} when {self.condition}" if out else self.condition
+        return out
+
+    def variable_text(self) -> str:
+        """The mapping *without* its domain prefix, e.g. ``VSORRES when ...``.
+
+        This -- not :meth:`label_text` -- is what goes on the page and into the
+        control sheet's ``anno1``/``anno2`` cells. Under Metadata Submission
+        Guidelines v2.0 the domain is carried by the annotation's colour and by
+        the page-top legend, so repeating it inside every box is redundant; the
+        guidelines' own examples read ``BRTHDTC`` and ``RACE = ASIAN``, not
+        ``DM.BRTHDTC``. The control sheet likewise has its own ``domain`` column,
+        and duplicating it in the annotation cell invites the two disagreeing.
+        """
+        parts = [p for p in (self.variable,) if p]
+        out = parts[0] if parts else ""
+        if self.fixed_value:
+            out = f"{out} = {self.fixed_value}" if out else self.fixed_value
+        if self.condition:
+            out = f"{out} when {self.condition}" if out else self.condition
+        return out
 
     def display_text(self) -> str:
         """What actually gets drawn on the page.
 
-        Fields that map to nothing still need a visible mark: a reviewer has
-        to be able to tell "deliberately not submitted" from "nobody looked at
-        it". Falling back to label_text() alone would render them as blank and
-        silently drop them from the artifact.
+        The literal ``text`` wins when present -- a reviewer's exact wording is
+        never re-derived. Rows that map to nothing still need a visible mark: a
+        reviewer has to be able to tell "deliberately not submitted" from
+        "nobody looked at it". Falling back to an empty string would render them
+        as blank and silently drop them from the artifact.
         """
-        text = self.label_text()
-        if text:
-            return text
+        if self.text.strip():
+            return self.text.strip()
+        composed = self.variable_text()
+        if composed:
+            return composed
         if self.origin is Origin.NOT_SUBMITTED:
-            return "[Not Submitted]"
+            return NOT_SUBMITTED_TEXT
         return ""
 
 
@@ -368,5 +519,17 @@ class AnnotationSet(BaseModel):
         return [a for a in self.annotations if a.page_index == page_index]
 
     def submittable(self) -> list["SdtmAnnotation"]:
-        """Everything that is not rejected -- i.e. what XFDF should carry."""
+        """Everything that is not rejected -- i.e. what the artifact carries."""
         return [a for a in self.annotations if a.review_status is not ReviewStatus.REJECTED]
+
+    def domains_for_page(self, page_index: int) -> list[str]:
+        """Distinct domains on a page, in first-encountered order.
+
+        The page-top legend banner lists these, and ``pipeline.msg`` assigns
+        colours in this order.
+        """
+        seen: list[str] = []
+        for a in sorted(self.for_page(page_index), key=lambda a: (-a.bbox.y1, a.bbox.x0)):
+            if a.domain and a.domain not in seen:
+                seen.append(a.domain)
+        return seen

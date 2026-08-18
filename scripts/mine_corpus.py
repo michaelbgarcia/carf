@@ -12,7 +12,7 @@ this wraps.
 The output CSV is meant for two downstream uses: pass it to
 ``attribute_domains(..., precedent=...)`` (or `pipeline.parse_annotated_pdf.
 parse_annotated_pdf(..., precedent=...)`) as a fallback for pages with no
-local domain banner, and/or pass it to `scripts/extract_and_prompt.py
+local domain banner, and/or pass it to `scripts/build_sheet.py
 --precedent-csv` to give Copilot real historical precedent in its
 instructions.
 

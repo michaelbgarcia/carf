@@ -1,12 +1,18 @@
-"""XFDF writer.
+"""XFDF writer -- an export format, no longer the review surface.
 
-Task order step 6.
+**This is off the critical path.** The artifact a human touches is now the XLSX
+control sheet (``pipeline/control_sheet.py``), which is where ``review_status``
+moves off ``proposed`` and where the Part 11 argument about a human being in the
+loop attaches. ``scripts/annotate.py`` renders the submission PDF from that
+sheet directly.
 
-XFDF is the artifact a human touches: reviewed and possibly hand-edited in
-Acrobat, or re-exported from the Dash review UI once that exists. From the
-moment it is written it -- not ``proposals.json`` -- is the authoritative
-record. ``xfdf_to_pdf.py`` reads it back and deliberately does not
-cross-check against anything upstream.
+XFDF stays for two reasons that are worth the module: it is the interchange
+format for opening this pipeline's annotations *in Acrobat* alongside the PDF,
+which is how a reviewer who prefers Acrobat to Excel can still comment; and it
+round-trips through ``xfdf_to_pdf.py``, so annotations edited in Acrobat can be
+rendered back out. When an XFDF *has* been hand-edited it is authoritative over
+upstream records for the same reason the sheet is -- a human touched it -- and
+``xfdf_to_pdf.py`` deliberately does not cross-check it against anything.
 
 Two things to get right:
 
@@ -35,7 +41,8 @@ from pathlib import Path
 from typing import Optional
 
 from pipeline.geometry import format_xfdf_rect
-from pipeline.models import AnnotationSet, ReviewStatus, SdtmAnnotation
+from pipeline.models import AnnotationKind, AnnotationSet, ReviewStatus, SdtmAnnotation
+from pipeline.msg import TEXT_COLOR, to_pdf_color
 
 XFDF_NS = "http://ns.adobe.com/xfdf/"
 CARF_NS = "https://github.com/carf/annotations"
@@ -51,8 +58,38 @@ def _pdf_date(dt: Optional[datetime]) -> str:
     return dt.strftime("D:%Y%m%d%H%M%SZ") if dt else ""
 
 
+def _hex(rgb: tuple[int, int, int]) -> str:
+    return "#{:02X}{:02X}{:02X}".format(*rgb)
+
+
 def _color_for(annot: SdtmAnnotation) -> str:
-    return NOTE_COLOR if not annot.label_text() else DEFAULT_COLOR
+    """XFDF ``@color`` -- the annotation's background, matching MSG.
+
+    ``@color`` maps to the PDF ``/C`` entry, which on a FreeText annot is the
+    background fill (see ``render.py``). So an annotation carrying an MSG colour
+    exports with it, and Acrobat shows the same coloured box the rendered PDF
+    has. Annotations with no domain colour keep the older red/grey text
+    convention, since an uncoloured box would be invisible.
+    """
+    if annot.color is not None:
+        return _hex(annot.color)
+    return NOTE_COLOR if annot.kind is AnnotationKind.NOTE or not annot.label_text() else DEFAULT_COLOR
+
+
+def _appearance(annot: SdtmAnnotation) -> str:
+    """The ``<defaultappearance>`` string -- font plus *text* colour.
+
+    Black on an MSG fill, per the guidelines; otherwise the red/grey text
+    convention, which is the only thing carrying the distinction when there is no
+    fill behind it.
+    """
+    if annot.color is not None:
+        r, g, b = to_pdf_color(TEXT_COLOR)
+    elif annot.kind is AnnotationKind.NOTE or not annot.label_text():
+        r = g = b = 0.48
+    else:
+        r, g, b = (0.80, 0.05, 0.05)
+    return f"/Helv {FONT_SIZE:g} Tf {r:g} {g:g} {b:g} rg"
 
 
 def annotation_to_element(annot: SdtmAnnotation) -> ET.Element:
@@ -82,18 +119,20 @@ def annotation_to_element(annot: SdtmAnnotation) -> ET.Element:
     contents.text = annot.display_text()
 
     appearance = ET.SubElement(el, f"{{{XFDF_NS}}}defaultappearance")
-    r, g, b = (0.80, 0.05, 0.05) if _color_for(annot) == DEFAULT_COLOR else (0.48,) * 3
-    appearance.text = f"/Helv {FONT_SIZE:g} Tf {r:g} {g:g} {b:g} rg"
+    appearance.text = _appearance(annot)
 
     meta = ET.SubElement(el, META_TAG)
     for key, value in (
-        ("field_id", annot.field_id),
+        ("row_id", annot.row_id),
+        ("slot", str(annot.slot)),
         ("domain", annot.domain),
         ("variable", annot.variable),
         ("condition", annot.condition),
+        ("fixed_value", annot.fixed_value),
         ("codelist", annot.codelist),
         ("origin", annot.origin.value if annot.origin else None),
         ("confidence", f"{annot.confidence:g}" if annot.confidence is not None else None),
+        ("suggested", "true" if annot.suggested else None),
         ("review_status", annot.review_status.value),
         ("reviewed_by", annot.reviewed_by),
         ("rationale", annot.rationale),

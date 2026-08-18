@@ -1,25 +1,23 @@
 """A stand-in for a Copilot reply, for testing plumbing only.
 
 .. danger::
-   This is NOT a Copilot response and must never be treated as one. The build
-   instructions are explicit: ``parse_response.py`` has to be exercised against
-   a real reply, because Copilot's actual formatting quirks are the thing that
-   needs coverage, and a hand-written sample only ever exercises the quirks
-   somebody already thought of. That is doubly true now that the format is a
-   spec-sheet round trip rather than a JSON array -- markdown-table
-   reformatting, CSV quoting under a chat paste, and attachment-vs-paste
-   behaviour are all real unknowns this file cannot resolve.
+   This is NOT a Copilot response and must never be treated as one.
+   ``parse_response.py`` still has to be exercised against a real reply, because
+   Copilot's actual formatting quirks are the thing that needs coverage, and a
+   hand-written sample only ever exercises the quirks somebody already thought
+   of. Markdown-table reformatting, CSV quoting under a chat paste, and
+   attachment-vs-paste behaviour are all real unknowns this file cannot resolve.
 
    What this file is for is the *other* thing tests need: an end-to-end run of
-   extract -> batch -> ingest -> XFDF -> PDF that does not require a human at
-   the keyboard. It proves the pipeline is wired together. It proves nothing
-   about the parser's tolerance of real chat output.
+   rows -> batch -> ingest -> sheet -> PDF that does not require a human at the
+   keyboard. It proves the pipeline is wired together. It proves nothing about
+   the parser's tolerance of real chat output.
 
    When a real reply arrives, save it verbatim as a fixture and add cases from
    whatever it actually did.
 
-The mappings below are plausible SDTM for the synthetic CRF, hand-written by
-the same process that produced ``scripts/illustrative_target.py``.
+The mappings below are plausible SDTM for the synthetic CRF, invented by hand --
+the same status as ``scripts/worked_example.py``'s.
 """
 
 from __future__ import annotations
@@ -27,45 +25,58 @@ from __future__ import annotations
 import csv
 import io
 
-from pipeline.models import FieldSet
+from pipeline.models import RowSet
 from pipeline.prompt import SHEET_COLUMNS
 
-# acroform_name prefix -> (kind, domain, variable, condition, codelist, origin)
-_MAPPINGS = {
-    "DM_SITEID": ("variable", "DM", "SITEID", None, None, "Collected"),
-    "DM_USUBJID": ("variable", "DM", "SUBJID", None, None, "Collected"),
-    "DM_BRTHDTC": ("variable", "DM", "BRTHDTC", None, None, "Collected"),
-    "DM_AGE": ("variable", "DM", "AGE", None, None, "Collected"),
-    "DM_SEX": ("variable", "DM", "SEX", None, "C66731", "Collected"),
-    "DM_RACE": ("variable", "DM", "RACE", None, "C74457", "Collected"),
-    "DM_ETHNIC": ("variable", "DM", "ETHNIC", None, "C66790", "Collected"),
-    "DM_COUNTRY": ("variable", "DM", "COUNTRY", None, None, "Collected"),
-    "DM_INVINIT": ("note", None, None, None, None, "NotSubmitted"),
-    "VS_VISITDAT": ("variable", "VS", "VSDTC", None, None, "Collected"),
-    "VS_POS": ("variable", "VS", "VSPOS", None, "C71148", "Collected"),
-    "VS_ASSINIT": ("note", None, None, None, None, "NotSubmitted"),
+# Question text -> (kind, domain, variable, variable2, condition, codelist, origin)
+_MAPPINGS: dict[str, tuple] = {
+    "Site Identifier": ("variable", "DM", "SITEID", "", "", "", "Collected"),
+    "Year of Birth (yyyy)": ("variable", "DM", "BRTHDTC", "", "", "", "Collected"),
+    # The two-variables-on-one-line case, which exercises the variable2 column.
+    "Age (years) at time of consent": ("variable", "DM", "AGE", "AGEU", "", "", "Collected"),
+    "Sex": ("variable", "DM", "SEX", "", "", "C66731", "Collected"),
+    "Race (check all that apply)": ("variable", "DM", "RACE", "", "", "C74457", "Collected"),
+    "Ethnicity": ("variable", "DM", "ETHNIC", "", "", "C66790", "Collected"),
+    "Country of Enrollment": ("variable", "DM", "COUNTRY", "", "", "", "Collected"),
+    "Visit Date": ("variable", "VS", "VSDTC", "", "", "", "Collected"),
+    "Position": ("variable", "VS", "VSPOS", "", "", "C71148", "Collected"),
 }
 
-_VS_TESTS = {"SYSBP", "DIABP", "PULSE", "TEMP", "RESP"}
+# Findings-class rows: one result variable selected by a --TESTCD condition.
+_VS_TESTS = {
+    "Systolic Blood Pressure": "SYSBP",
+    "Diastolic Blood Pressure": "DIABP",
+    "Pulse Rate": "PULSE",
+    "Body Temperature": "TEMP",
+    "Respiratory Rate": "RESP",
+}
+
+_NOT_SUBMITTED_MARKERS = (
+    "SYNTHETIC TEST DATA",
+    "Protocol SYNTH-001",
+    "Form:",
+    "Form Demographics",
+    "Form Vital Signs",
+    "Form Instructions",
+    "Investigator Initials",
+    "Assessor Initials",
+    "INSTRUCTIONS",
+)
 
 
-def _map_field(acroform_name: str):
-    if acroform_name.startswith("VS_"):
-        parts = acroform_name.split("_")
-        if len(parts) == 3 and parts[1] in _VS_TESTS:
-            testcd, suffix = parts[1], parts[2]
-            condition = f"VSTESTCD = {testcd}"
-            if suffix == "RES":
-                return ("variable", "VS", "VSORRES", condition, None, "Collected")
-            return ("variable", "VS", "VSSTAT", condition, None, "Collected")
-    for prefix, mapping in _MAPPINGS.items():
-        if acroform_name.startswith(prefix):
-            return mapping
-    return ("variable", None, None, None, None, "Collected")
+def _map_row(text_1: str, text_2: str) -> tuple:
+    key = text_1 or text_2
+    if key in _MAPPINGS:
+        return _MAPPINGS[key]
+    if key in _VS_TESTS:
+        return ("variable", "VS", "VSORRES", "", f"VSTESTCD = {_VS_TESTS[key]}", "", "Collected")
+    if key.startswith(_NOT_SUBMITTED_MARKERS):
+        return ("note", "", "", "", "", "", "NotSubmitted")
+    return ("variable", "", "", "", "", "", "Collected")
 
 
 def build_response(
-    fieldset: FieldSet,
+    rows: RowSet,
     page_indexes: list[int],
     *,
     as_markdown_table: bool = False,
@@ -75,33 +86,34 @@ def build_response(
 ) -> str:
     """Render a stand-in filled-in sheet, optionally mangled the way a chat UI would."""
     wanted = set(page_indexes)
-    fields = sorted(
-        (f for f in fieldset.fields if f.page_index in wanted),
-        key=lambda f: (f.page_index, -f.bbox.y1, f.bbox.x0),
+    selected = sorted(
+        (r for r in rows.rows if r.page_index in wanted),
+        key=lambda r: (r.page_index, -r.anchor.y1, r.anchor.x0),
     )
 
-    rows = []
-    for f in fields:
-        if f.field_id in drop:
+    out = []
+    for row in selected:
+        if row.row_id in drop:
             continue
-        kind, domain, variable, condition, codelist, origin = _map_field(
-            f.acroform_name or ""
+        kind, domain, variable, variable2, condition, codelist, origin = _map_row(
+            row.text_1, row.text_2
         )
-        rows.append(
+        out.append(
             {
-                "field_id": f.field_id,
-                "page": f.page_index + 1,
-                "label": f.label,
-                "context": f.context,
-                "acroform_name": f.acroform_name or "",
+                "row_id": row.row_id,
+                "page": row.display_page,
+                "form": row.form,
+                "text_1": row.text_1,
+                "text_2": row.text_2,
                 "kind": kind,
-                "domain": domain or "",
-                "variable": variable or "",
-                "condition": condition or "",
-                "codelist": codelist or "",
+                "domain": domain,
+                "variable": variable,
+                "variable2": variable2,
+                "condition": condition,
+                "codelist": codelist,
                 "origin": origin,
                 "confidence": 0.9 if domain else 0.95,
-                "rationale": f"Mapped from the form caption {f.label!r}.",
+                "rationale": f"Mapped from the question text {row.text_1!r}.",
             }
         )
 
@@ -109,19 +121,19 @@ def build_response(
         header = "| " + " | ".join(SHEET_COLUMNS) + " |"
         sep = "|" + "|".join(["---"] * len(SHEET_COLUMNS)) + "|"
         lines = [header, sep]
-        for r in rows:
+        for r in out:
             lines.append("| " + " | ".join(str(r[c]) for c in SHEET_COLUMNS) + " |")
         body = "\n".join(lines)
     else:
         buf = io.StringIO()
         writer = csv.DictWriter(buf, fieldnames=SHEET_COLUMNS, lineterminator="\n")
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(out)
         body = buf.getvalue()
 
-    if smart_quotes and rows:
-        # Simulate a chat renderer swapping straight quotes for curly ones in
-        # the first quoted rationale it encounters.
+    if smart_quotes and out:
+        # Simulate a chat renderer swapping straight quotes for curly ones in the
+        # first quoted rationale it encounters.
         body = body.replace('"', "“", 1).replace('"', "”", 1)
     if chatty:
         body = (

@@ -2,10 +2,10 @@
 
 The instructions require two, each written *before* the work downstream of it:
 
-* the stamp/pixmap test below gates task order step 3 -- proves fitz -> BBox
-  is right before anything is built on top of extracted coordinates
-* ``test_annotation_survives_xfdf_round_trip`` gates step 9 -- still pending
-  ``xfdf.py`` and ``xfdf_to_pdf.py``
+* the stamp/pixmap tests below prove fitz -> BBox is right, before anything is
+  built on top of extracted coordinates
+* ``test_annotation_survives_xfdf_round_trip`` proves BBox -> fitz is its exact
+  inverse, through the XFDF export and back
 
 Both exist because a y-flip bug is *not* reliably visible. An annotation
 placed at ``page_height - y`` instead of ``y`` still lands on the page, still
@@ -26,15 +26,16 @@ from pipeline.models import (
     PageGeometry,
     SdtmAnnotation,
 )
+from pipeline.rows import extract_rows
 from pipeline.xfdf import write_xfdf
 from pipeline.xfdf_to_pdf import parse_xfdf, xfdf_to_pdf
 
 STAMP = (1.0, 0.0, 0.0)
 WHITE_ISH = 0.9  # channel value above this counts as unmarked page
 
-# The top-of-page field. Deliberately chosen: a mid-page field would land close
-# to its own mirror image and weaken every assertion below.
-TARGET = "DM_SITEID"
+# The row nearest the top of the page. Deliberately chosen: a mid-page row would
+# land close to its own mirror image and weaken every assertion below.
+TARGET_TEXT = "Site Identifier"
 
 
 def read_annots(pdf_path, page_index: int = 0) -> list[tuple[str, tuple]]:
@@ -63,42 +64,48 @@ def _center(rect) -> tuple[int, int]:
 
 
 @pytest.fixture
-def target_page(crfs, truth):
-    """The page carrying TARGET, plus that field's truth record."""
-    field = next(f for f in truth.fields if f.field_id == TARGET)
+def target_page(crfs):
+    """The page carrying TARGET_TEXT, plus that row."""
+    rows = extract_rows(crfs["acroform"])
+    row = next(r for r in rows.rows if r.text_1 == TARGET_TEXT)
     doc = pymupdf.open(crfs["acroform"])
-    return doc[field.page_index], field
+    return doc[row.page_index], row
 
 
-# --- step 3 gate ----------------------------------------------------------
+# --- extraction coordinate gate -------------------------------------------
 
 
-def test_truth_bbox_converts_back_onto_the_real_widget(target_page):
-    """Numeric half: the flipped bbox must land on the actual AcroForm rect."""
-    page, field = target_page
-    rect = bbox_to_fitz_rect(field.bbox, page.rect.height)
-    widget = next(w for w in page.widgets() if w.field_name == TARGET)
-    assert rect == pytest.approx(tuple(widget.rect), abs=1e-6)
+def test_row_bbox_flips_back_onto_its_own_printed_text(target_page):
+    """The strongest available check: read the text back out of the flipped rect.
 
-
-def test_stamped_field_lands_on_the_form_field(target_page):
-    """Pixel half: stamp the field, render, confirm the ink is on the field.
-
-    This is the check the instructions describe, made assertable. Rendering at
-    72 dpi keeps one pixel to one point, so pixel coordinates and fitz
-    coordinates are the same numbers.
+    Under the old field model this compared a bbox against an AcroForm widget
+    rect -- numbers against numbers, both produced by the same code. Rows are
+    extracted from *text*, so the flipped rect can be asked what text it
+    contains, and the answer either is the row's own text or the flip is wrong.
     """
-    page, field = target_page
-    rect = pymupdf.Rect(*bbox_to_fitz_rect(field.bbox, page.rect.height))
+    page, row = target_page
+    rect = pymupdf.Rect(*bbox_to_fitz_rect(row.bbox_1, page.rect.height))
+    recovered = " ".join(page.get_textbox(rect).split())
+    assert recovered == row.text_1
+
+
+def test_stamped_row_lands_on_the_printed_text(target_page):
+    """Pixel half: stamp the row, render, confirm the ink is on the row.
+
+    Rendering at 72 dpi keeps one pixel to one point, so pixel coordinates and
+    fitz coordinates are the same numbers.
+    """
+    page, row = target_page
+    rect = pymupdf.Rect(*bbox_to_fitz_rect(row.bbox_1, page.rect.height))
 
     before = page.get_pixmap(dpi=72)
     cx, cy = _center(rect)
-    assert not _is_stamped(before.pixel(cx, cy)), "field is already red before stamping"
+    assert not _is_stamped(before.pixel(cx, cy)), "row is already red before stamping"
 
     page.draw_rect(rect, color=STAMP, fill=STAMP)
     after = page.get_pixmap(dpi=72)
 
-    assert _is_stamped(after.pixel(cx, cy)), "stamp did not land on the field"
+    assert _is_stamped(after.pixel(cx, cy)), "stamp did not land on the row"
     # ...and inside its corners too, so a stamp of the wrong size fails.
     for x, y in (
         (int(rect.x0) + 2, int(rect.y0) + 2),
@@ -113,8 +120,8 @@ def test_the_mirrored_position_stays_blank(target_page):
     Without this, a test that only checks the stamp is somewhere on the page
     passes just as happily with the flip inverted.
     """
-    page, field = target_page
-    rect = pymupdf.Rect(*bbox_to_fitz_rect(field.bbox, page.rect.height))
+    page, row = target_page
+    rect = pymupdf.Rect(*bbox_to_fitz_rect(row.bbox_1, page.rect.height))
     page.draw_rect(rect, color=STAMP, fill=STAMP)
     pix = page.get_pixmap(dpi=72)
 
@@ -129,11 +136,11 @@ def test_skipping_the_flip_puts_the_stamp_somewhere_else(target_page):
 
     Treating the PDF-space bbox as if it were already a fitz rect is exactly
     the bug this whole module guards against. If that mistake still landed on
-    the widget, none of the assertions above would mean anything.
+    the row, none of the assertions above would mean anything.
     """
-    page, field = target_page
-    correct = pymupdf.Rect(*bbox_to_fitz_rect(field.bbox, page.rect.height))
-    unflipped = pymupdf.Rect(*field.bbox.as_tuple())
+    page, row = target_page
+    correct = pymupdf.Rect(*bbox_to_fitz_rect(row.bbox_1, page.rect.height))
+    unflipped = pymupdf.Rect(*row.bbox_1.as_tuple())
     assert not correct.intersects(unflipped)
 
 
@@ -144,12 +151,12 @@ KNOWN_BBOX = BBox(x0=201.5, y0=654.25, x1=333.75, y1=665.5)
 
 def _one_annotation(bbox=KNOWN_BBOX) -> AnnotationSet:
     return AnnotationSet(
-        source_pdf="SYNTHETIC_sample_crf_acroform.pdf",
+        source_pdf="SYNTHETIC_sample_crf_twocol_acroform.pdf",
         pages=[PageGeometry(page_index=0, width=612.0, height=792.0)],
         annotations=[
             SdtmAnnotation(
                 annot_id="rt-001",
-                field_id="DM_USUBJID",
+                row_id="p1_r004",
                 page_index=0,
                 bbox=bbox,
                 kind=AnnotationKind.VARIABLE,
@@ -172,7 +179,9 @@ def test_annotation_survives_xfdf_round_trip(tmp_path):
     assert len(back) == 1
     assert back[0].bbox.as_tuple() == pytest.approx(KNOWN_BBOX.as_tuple(), abs=1e-3)
     assert back[0].page_index == 0
-    assert back[0].text == "DM.SUBJID"
+    # No domain prefix: under MSG the domain is carried by the annotation's
+    # colour and the page legend, not repeated inside every box.
+    assert back[0].text == "SUBJID"
 
 
 def test_round_trip_lands_on_the_page_where_it_started(crfs, tmp_path):
@@ -193,7 +202,7 @@ def test_xfdf_page_attribute_is_zero_based(tmp_path):
 
 
 def test_hand_edited_xfdf_is_honoured(crfs, tmp_path):
-    """Edit the XFDF by hand; render_final.py must pick the edit up.
+    """Edit the XFDF by hand; the renderer must pick the edit up.
 
     The actual scenario the step exists for. A pass-through test of an
     unedited file proves much less, because the failure mode is the renderer
@@ -206,7 +215,7 @@ def test_hand_edited_xfdf_is_honoured(crfs, tmp_path):
     edited = (
         path.read_text(encoding="utf-8")
         .replace(format_xfdf_rect(KNOWN_BBOX), format_xfdf_rect(moved))
-        .replace("<contents>DM.SUBJID</contents>", "<contents>DM.USUBJID</contents>")
+        .replace("<contents>SUBJID</contents>", "<contents>DM.USUBJID</contents>")
     )
     path.write_text(edited, encoding="utf-8")
 
@@ -228,7 +237,7 @@ def test_renderer_does_not_consult_pre_review_data(crfs, tmp_path):
     path = write_xfdf(_one_annotation(), tmp_path / "rt.xfdf")
     path.write_text(
         path.read_text(encoding="utf-8").replace(
-            "<contents>DM.SUBJID</contents>", "<contents>ZZ.ANYTHING</contents>"
+            "<contents>SUBJID</contents>", "<contents>ZZ.ANYTHING</contents>"
         ),
         encoding="utf-8",
     )

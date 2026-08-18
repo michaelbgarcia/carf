@@ -1,37 +1,47 @@
 """Recovers structured SDTM mappings from an already-annotated CRF PDF.
 
-Not a step in the forward pipeline (extract -> prompt -> parse_response ->
-layout -> xfdf -> xfdf_to_pdf). This runs the opposite direction: given a
-*finished* aCRF -- this pipeline's own output from a prior study, or a third
-party's, as long as it follows the same FDA aCRF convention of small FreeText
-markup positioned near the field it describes -- recover a label ->
-domain/variable/condition table. See COWORK_INSTRUCTIONS.md-adjacent
-discussion: this is what makes a corpus of historical aCRFs usable as
-Copilot-prompt precedent or as a QC cross-check, rather than just a pile of
-PDFs nobody can query.
+Not a step in the forward pipeline (rows -> precedent -> control sheet ->
+layout -> annotated PDF). This runs the opposite direction: given a *finished*
+aCRF -- this pipeline's own output from a prior study, or a third party's, as
+long as it follows the same FDA aCRF convention of small FreeText markup
+positioned near what it describes -- recover a text -> domain/variable/condition
+table. That table is what makes a corpus of historical aCRFs usable as the
+pre-population source for new ones (see ``pipeline.corpus_precedent``), rather
+than a pile of PDFs nobody can query.
 
 Two things make this lossy in a way the forward pipeline is not:
 
-* **No join key survives to the final PDF.** ``render.draw_annotation`` (via
-  ``xfdf_to_pdf.render_annotations``) draws only a bbox and a text string --
-  the ``field_id`` that ties an annotation to the field it describes lives in
-  XFDF's ``<carf:meta>`` only (see ``xfdf.py``), and XFDF is never part of a
-  finished aCRF. So a mark has to be re-matched to a field by *position* --
-  the same right/below/left placement ``layout.py`` used, inferred in
-  reverse from geometry alone. A wrong match is possible, not just a missing
-  one; every match here is reported with the distance it was found at so a
-  caller can decide how much to trust it.
+* **No join key survives to the final PDF.** ``render.draw_annotation`` draws
+  only a bbox and a text string -- the ``row_id`` that ties an annotation to the
+  row it describes lives in XFDF's ``<carf:meta>`` and in the control sheet, and
+  neither is part of a finished aCRF. So a mark has to be re-matched by
+  *position*.
+
+  The two-column row model makes that materially more reliable than it was.
+  Marks are matched against **rows**, and an annotation's position relative to
+  its row is nearly unambiguous: ``layout.place_row`` puts it at
+  ``bbox_1.x1 + GAP`` on the row's own baseline, so a mark sharing a row's
+  vertical extent and starting just past its question text is that row's, full
+  stop. The previous design matched against *detected capture fields*, where a
+  dense grid of same-sized widgets a few points apart meant nearest-centroid
+  regularly picked the neighbouring row. A wrong match is still possible for
+  third-party markup that was never positioned by this codebase; every match is
+  reported with the distance it was found at so a caller can weigh it.
 * **Origin (Define-XML) never reaches the page.** ``display_text()`` renders
   only domain/variable/condition -- never origin -- so a recovered mapping
   can say what a field was called, never how it was collected. Don't invent
   an origin here; leave it to the caller (e.g. defaulting to Collected as a
   starting guess for human review, never as a fact).
 
-Visual convention assumed below -- this pipeline's own, and the general FDA
-aCRF convention it mirrors: variable annotations in plain, usually red text
-near the field; domain banners boxed; not-submitted fields in a muted/gray
-color. A source that draws its aCRFs a different way needs the color/border
-heuristics re-tuned; the matching logic underneath does not change.
+Two visual conventions are read, because a corpus spans both -- see
+:func:`classify_mark` for the rules and why their order matters. In short:
+Metadata Submission Guidelines v2.0 output (what this pipeline now writes) marks
+a mapping with a domain-coloured background and a comment with a dashed border,
+while older output marks a mapping with red text, a note with grey text and a
+domain banner with a border. Under MSG every mark is bordered and black, so the
+older signals have to be checked last or they invert the classification
+completely. A source drawing its aCRFs some third way needs those heuristics
+re-tuned; the position matching underneath does not change.
 """
 
 from __future__ import annotations
@@ -45,11 +55,10 @@ from typing import Optional
 import pymupdf
 
 from pipeline import layout
-from pipeline.extract import extract_fields
 from pipeline.geometry import fitz_rect_to_bbox
-from pipeline.models import BBox, CRFField, FieldSet
+from pipeline.models import NOT_SUBMITTED_TEXT, BBox, CRFRow, RowSet
+from pipeline.rows import extract_rows
 
-NOT_SUBMITTED_TEXT = "[Not Submitted]"
 DEFAULT_MAX_MATCH_DISTANCE = 200.0  # points; layout.py's own moves are well under this
 _GRAYSCALE_TOLERANCE = 0.08  # max channel spread that still counts as "gray"
 _GRAY_CEILING = 0.9  # near-white text would also read as "gray"; exclude it
@@ -75,8 +84,10 @@ class RawMark:
     page_index: int
     bbox: BBox  # PDF user space
     text: str
-    boxed: bool  # non-zero border width -- this pipeline's domain-banner marker
-    muted: bool  # grayscale text color -- this pipeline's not-submitted marker
+    boxed: bool  # non-zero border width
+    muted: bool  # grayscale text color
+    dashed: bool = False  # dashed border -- MSG's marker for a comment note
+    fill: Optional[tuple[float, float, float]] = None  # /C background, 0..1 per channel
 
 
 def _is_muted(da: Optional[tuple]) -> bool:
@@ -105,7 +116,7 @@ def read_marks(pdf_path: str | Path) -> list[RawMark]:
     file -- same idea, different source. Deliberately ignores any join-key
     metadata (there isn't any, see module docstring) and does no field
     matching; that is a separate, uncertain step handled by
-    :func:`match_marks_to_fields`.
+    :func:`match_marks_to_rows`.
     """
     doc = pymupdf.open(pdf_path)
     try:
@@ -119,13 +130,19 @@ def read_marks(pdf_path: str | Path) -> list[RawMark]:
                 if not text:
                     continue
                 da = doc.xref_get_key(annot.xref, "DA")
+                border = annot.border
+                # On a FreeText annot the background lives in /C, which PyMuPDF
+                # reports back under "stroke" -- see render.py's docstring.
+                fill = annot.colors.get("stroke") or None
                 out.append(
                     RawMark(
                         page_index=page_index,
                         bbox=fitz_rect_to_bbox(annot.rect, height),
                         text=text,
-                        boxed=annot.border.get("width", 0.0) > 0.0,
+                        boxed=border.get("width", 0.0) > 0.0,
                         muted=_is_muted(da),
+                        dashed=bool(border.get("dashes")),
+                        fill=tuple(fill) if fill else None,
                     )
                 )
         return out
@@ -133,45 +150,101 @@ def read_marks(pdf_path: str | Path) -> list[RawMark]:
         doc.close()
 
 
-_LEGEND_RE = re.compile(r"^\s*(?P<code>[A-Za-z]{2,8})\s*=\s*(?P<name>[A-Za-z][A-Za-z0-9 /&\-]*)\s*$")
+#: A legend entry, in either shape it gets written. MSG v2.0 uses
+#: ``DM (Demographics)``; this codebase's older output and some third-party
+#: aCRFs use ``DM = Demographics``. Both are a bare domain code plus its full
+#: name, and both collide in shape with a fixed-value mark, so position -- not
+#: text -- is what finally decides (see :func:`split_legend_marks`).
+_LEGEND_RE = re.compile(
+    r"^\s*(?P<code>[A-Za-z]{2,8})\s*(?:=\s*(?P<eq_name>[A-Za-z][A-Za-z0-9 /&\-]*)"
+    r"|\(\s*(?P<paren_name>[A-Za-z][A-Za-z0-9 /&\-]*?)\s*\))\s*$"
+)
+
+
+def _legend_name(match: re.Match) -> str:
+    return (match.group("eq_name") or match.group("paren_name") or "").strip()
 
 
 def split_legend_marks(
-    marks: list[RawMark], fieldset: FieldSet
+    marks: list[RawMark], rows: RowSet
 ) -> tuple[dict[int, dict[str, str]], list[RawMark]]:
     """Pull page-level domain legends (e.g. ``DS=Disposition``) out of the marks.
 
-    A legend sits in a page's header/margin, above every capture field on
-    that page, and reads as a bare domain code -> full name -- the same
-    ``CODE = phrase`` shape a fixed-value assignment mark can have (e.g.
-    ``DSCAT = PROTOCOL MILESTONE``, see :func:`parse_mapping_text`). Text
-    shape alone cannot tell the two apart; position can, and must: a legend
-    is never handed to ``_mark_to_mapping``/``attribute_domains``/
-    ``match_marks_to_fields`` -- it describes the page, not a field, and
-    parsing it as one would invent a nonsense variable named after the
-    domain's own full name.
+    A legend sits in a page's header/margin, above every row on that page, and
+    reads as a bare domain code -> full name -- the same ``CODE = phrase`` shape
+    a fixed-value assignment mark can have (e.g. ``DSCAT = PROTOCOL MILESTONE``,
+    see :func:`parse_mapping_text`). Text shape alone cannot tell the two apart;
+    position can, and must: a legend is never handed to
+    ``_mark_to_mapping``/``attribute_domains``/:func:`match_marks_to_rows` -- it
+    describes the page, not a row, and parsing it as one would invent a nonsense
+    variable named after the domain's own full name.
 
-    Returns ``({page_index: {code: name}}, marks_with_legends_removed)``. A
-    page with no detected fields yields no legends from it -- nothing to
-    compare a mark's position against, and no fields to make the legend
-    useful to anyway.
+    Returns ``({page_index: {code: name}}, marks_with_legends_removed)``. A page
+    with no extracted rows yields no legends from it -- nothing to compare a
+    mark's position against, and no rows to make the legend useful to anyway.
+
+    See :func:`legend_color_map` for the other thing a legend carries.
     """
-    field_top: dict[int, float] = {}
-    for f in fieldset.fields:
-        field_top[f.page_index] = max(field_top.get(f.page_index, f.bbox.y1), f.bbox.y1)
+    row_top: dict[int, float] = {}
+    for row in rows.rows:
+        top = row.anchor.y1
+        row_top[row.page_index] = max(row_top.get(row.page_index, top), top)
 
     legends: dict[int, dict[str, str]] = {}
     remaining: list[RawMark] = []
     for m in marks:
-        top = field_top.get(m.page_index)
+        top = row_top.get(m.page_index)
         match = _LEGEND_RE.match(m.text) if top is not None else None
         if match and m.bbox.y0 >= top:
-            legends.setdefault(m.page_index, {})[match.group("code").upper()] = match.group(
-                "name"
-            ).strip()
+            legends.setdefault(m.page_index, {})[match.group("code").upper()] = _legend_name(match)
             continue
         remaining.append(m)
     return legends, remaining
+
+
+def _color_key(fill: Optional[tuple[float, float, float]]) -> Optional[tuple[int, int, int]]:
+    """Quantise a fill to 0-255 ints, so PDF float rounding cannot split a colour.
+
+    A colour written as ``0.75 1 1`` and read back as ``0.7490196`` must compare
+    equal, or every annotation would appear to be its own domain.
+    """
+    if fill is None:
+        return None
+    return tuple(int(round(c * 255)) for c in fill)  # type: ignore[return-value]
+
+
+def legend_color_map(
+    marks: list[RawMark], rows: RowSet
+) -> dict[int, dict[tuple[int, int, int], str]]:
+    """``{page_index: {fill colour: domain code}}``, from the page's own legend.
+
+    The attribution tier that MSG styling makes necessary. Under the guidelines a
+    variable annotation reads ``BRTHDTC``, not ``DM.BRTHDTC`` -- the domain is
+    carried by the box's *colour*, keyed by the legend at the top of the page. So
+    a mark's own text no longer names its domain, and without reading the legend
+    the whole document would come back unattributed.
+
+    That is not a guess. The legend is an explicit assertion, printed on the page,
+    that this colour means this domain -- which is why the caller ranks it
+    immediately after a boxed banner and well ahead of the built-in constants and
+    mined precedent tiers.
+
+    Runs on the *unsplit* mark list, since ``split_legend_marks`` removes exactly
+    the marks this needs.
+    """
+    legends, _ = split_legend_marks(marks, rows)
+    out: dict[int, dict[tuple[int, int, int], str]] = {}
+    for m in marks:
+        match = _LEGEND_RE.match(m.text)
+        if not match:
+            continue
+        code = match.group("code").upper()
+        if code not in legends.get(m.page_index, {}):
+            continue  # matched the shape but was not accepted as a legend
+        key = _color_key(m.fill)
+        if key is not None:
+            out.setdefault(m.page_index, {})[key] = code
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -207,7 +280,9 @@ def parse_mapping_text(
     value are stripped; case is otherwise preserved, same as `condition`.
     """
     text = text.strip()
-    if not text or text == NOT_SUBMITTED_TEXT:
+    # Case-insensitive: the house spelling is upper case per the guidelines, but
+    # historical aCRFs predate any house convention and use both.
+    if not text or text.upper() == NOT_SUBMITTED_TEXT.upper():
         return None, None, None, None
     m = _MAPPING_RE.match(text)
     if not m:
@@ -243,11 +318,12 @@ class RecoveredMapping:
     variable: Optional[str] = None
     condition: Optional[str] = None
     fixed_value: Optional[str] = None  # e.g. "PROTOCOL MILESTONE" from "DSCAT = PROTOCOL MILESTONE"
-    domain_inferred: bool = False  # True if `domain` came from a nearby banner, not this mark's own text
-    domain_inference_source: Optional[str] = None  # "banner" | "builtin" | "precedent"
-    field_id: Optional[str] = None
-    label: Optional[str] = None
-    context: Optional[str] = None
+    fill: Optional[tuple[float, float, float]] = None  # the mark's own background, for the legend-colour tier
+    domain_inferred: bool = False  # True if `domain` did not come from this mark's own text
+    domain_inference_source: Optional[str] = None  # "banner" | "legend" | "builtin" | "precedent"
+    row_id: Optional[str] = None
+    label: Optional[str] = None  # the matched row's text_1 -- the lookup key
+    context: Optional[str] = None  # form and response column, for disambiguation
     match_distance: Optional[float] = None  # points, centre-to-centre; None if unmatched
     synthesized: bool = False  # True only for summarize_page_domains' derived page-domain rows
     legend_name: Optional[str] = None  # cross-check: this domain's name in the page's own legend, if any
@@ -259,28 +335,83 @@ def _center(bbox: BBox) -> tuple[float, float]:
 
 
 def _distance(a: BBox, b: BBox) -> float:
+    """Centre-to-centre distance, reported as ``match_distance``."""
     ax, ay = _center(a)
     bx, by = _center(b)
     return ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
 
 
+def _proximity(mark: BBox, anchor: BBox) -> float:
+    """Distance from the mark's centre to the nearest point of ``anchor``.
+
+    Used for *ranking* tier-2 candidates, where centre-to-centre is actively
+    misleading. A row spanning the full page width -- a header, a footer, any row
+    on a single-column page -- has its centroid in the middle of a very wide box,
+    so an annotation sitting immediately to its right measures as hundreds of
+    points away and loses to a row it has nothing to do with, or falls outside
+    ``max_distance`` entirely and goes unmatched.
+
+    Clamping to the box makes "just outside the right-hand edge" the small
+    distance it visually is. ``match_distance`` still reports centre-to-centre,
+    so what a reviewer sees in the report is unchanged.
+    """
+    cx, cy = _center(mark)
+    nx = min(max(cx, anchor.x0), anchor.x1)
+    ny = min(max(cy, anchor.y0), anchor.y1)
+    return ((cx - nx) ** 2 + (cy - ny) ** 2) ** 0.5
+
+
+def classify_mark(mark: RawMark) -> str:
+    """``"domain"`` | ``"variable"`` | ``"note"`` from a mark's styling.
+
+    Two conventions have to be read here, and they conflict on every signal --
+    which is why this is a function with its rules written down rather than two
+    inline ``elif``s.
+
+    **MSG v2.0** (what this pipeline now writes, and what a compliant aCRF from
+    anywhere looks like): every annotation has a solid 1pt border and black text,
+    a mapping has a domain-coloured background, and a comment note is
+    distinguished by a *dashed* border. So under MSG, "has a border" and "has
+    black text" carry no information at all -- they are universal.
+
+    **The convention this codebase used to write** (and which older aCRFs in a
+    corpus follow): red text with no fill for a mapping, grey text for a note,
+    and a *boxed* mark for a domain banner.
+
+    Read in the wrong order these invert completely: MSG output is boxed
+    everywhere, which the old rule calls a domain banner, and its text is black,
+    which the old grey-text test calls a note. So the MSG signals are checked
+    first and the legacy ones only reached when a mark carries no MSG styling at
+    all.
+    """
+    if mark.dashed:
+        return "note"  # MSG: dashed border is the comment marker
+    if mark.fill is not None:
+        # MSG: a coloured background means a mapping. A domain legend banner is
+        # also filled, but never reaches here -- split_legend_marks removes it
+        # first, on position.
+        return "variable"
+    if mark.muted:
+        return "note"  # legacy: grey text
+    if mark.boxed:
+        return "domain"  # legacy: boxed banner, unfilled
+    return "variable"
+
+
 def _mark_to_mapping(mark: RawMark) -> RecoveredMapping:
     domain, variable, condition, fixed_value = parse_mapping_text(mark.text)
-    if mark.boxed:
+    kind = classify_mark(mark)
+    if kind == "domain":
         # A banner's text is its domain code alone -- what the regex above,
         # lacking a dot to key on, puts in `variable` for lack of anywhere
         # else to put it.
         domain, variable = (domain or variable), None
-        kind = "domain"
-    elif mark.muted:
-        kind = "note"
-    else:
-        kind = "variable"
     return RecoveredMapping(
         page_index=mark.page_index,
         bbox=mark.bbox,
         text=mark.text,
         kind=kind,
+        fill=mark.fill,
         domain=domain,
         variable=variable,
         condition=condition,
@@ -336,25 +467,35 @@ def _builtin_domain(variable: Optional[str]) -> Optional[str]:
 
 
 def attribute_domains(
-    mappings: list[RecoveredMapping], precedent: dict[str, str] | None = None
+    mappings: list[RecoveredMapping],
+    precedent: dict[str, str] | None = None,
+    legend_colors: dict[int, dict[tuple[int, int, int], str]] | None = None,
 ) -> list[RecoveredMapping]:
     """Fill in `domain` on a variable mark, weakest evidence last.
 
-    Four tiers, in order: the mark's own explicit domain (nothing to do);
-    the nearest boxed banner above it on the page (mirrors ``extract.py``'s
-    ``_section_heading`` -- a domain banner governs everything below it,
-    proximity is vertical-only, not bounded by horizontal overlap the way
-    caption lookup is, since a banner is usually left-aligned while the
-    fields under it are indented); CDISC-standardized built-in constants
-    (:func:`_builtin_domain`); and finally ``precedent`` -- a variable ->
-    domain table mined from a historical corpus (see
-    ``pipeline/corpus_precedent.py``), the weakest tier since it reflects
-    what other documents did, not what this one says.
+    Five tiers, in order:
 
-    ``domain_inference_source`` records which tier fired ("banner" |
-    "builtin" | "precedent"), so a caller mining this output as further
-    precedent can require the strongest evidence and avoid amplifying its
-    own guesses (see ``build_variable_domain_precedent``).
+    1. the mark's own explicit domain (nothing to do);
+    2. the nearest boxed banner above it on the page -- a domain banner governs
+       everything below it, so proximity is vertical-only rather than bounded by
+       horizontal overlap, since a banner is usually left-aligned while the rows
+       under it are indented;
+    3. the **page legend's colour key** (:func:`legend_color_map`), which is what
+       MSG-styled output leaves to read: its annotations say ``BRTHDTC``, not
+       ``DM.BRTHDTC``, and the domain lives in the box's colour;
+    4. CDISC-standardized built-in constants (:func:`_builtin_domain`);
+    5. ``precedent`` -- a variable -> domain table mined from a historical corpus
+       (see ``pipeline/corpus_precedent.py``), the weakest tier since it reflects
+       what other documents did, not what this one says.
+
+    Tier 3 sits above the built-ins deliberately. A legend is an explicit
+    assertion printed on the page being read; a built-in constant is a fact about
+    SDTMIG that may not match what this particular document did.
+
+    ``domain_inference_source`` records which tier fired ("banner" | "legend" |
+    "builtin" | "precedent"), so a caller mining this output as further precedent
+    can require the strongest evidence and avoid amplifying its own guesses (see
+    ``build_variable_domain_precedent``).
     """
     banners_by_page: dict[int, list[RecoveredMapping]] = {}
     for m in mappings:
@@ -382,6 +523,14 @@ def attribute_domains(
             )
             continue
 
+        by_color = (legend_colors or {}).get(m.page_index, {})
+        keyed = by_color.get(_color_key(m.fill)) if by_color else None
+        if keyed is not None:
+            out.append(
+                replace(m, domain=keyed, domain_inferred=True, domain_inference_source="legend")
+            )
+            continue
+
         builtin = _builtin_domain(m.variable)
         if builtin is not None:
             out.append(
@@ -405,174 +554,163 @@ def attribute_domains(
 # --------------------------------------------------------------------------
 
 
-_ALIGN_TOL = 0.05  # generous over XFDF's 3-decimal-place @rect rounding
-_NUDGE_TOL = 1e-3  # tolerance on (delta / NUDGE) being an integer
-_CENTROID_OFFSET = layout.MAX_NUDGES + 10.0  # keeps any centroid fallback ranked behind every exact match
+#: Tolerance on an exact reverse-layout alignment. Has to cover two things:
+#: XFDF's 3-decimal-place ``@rect`` rounding, and -- the one that bites -- the
+#: half-border-width inflation PyMuPDF applies to a bordered annotation's stored
+#: ``/Rect`` (a box placed at x0=260 is read back at 259.5, see ``render.py``).
+#: Under MSG styling *every* annotation is bordered, so a tolerance tighter than
+#: half a border width makes tier-1 matching silently unreachable and drops the
+#: whole corpus onto the weaker centroid fallback without any error.
+_ALIGN_TOL = layout.BORDER_INFLATION + 0.05
+_STEP_TOL = 1e-3  # tolerance on (delta / LINE_STEP) being an integer
+#: Keeps any distance fallback ranked behind every exact alignment.
+_CENTROID_OFFSET = layout.MAX_WRAPS + 10.0
 
 
-def _reverse_layout_score(mark_bbox: BBox, field_bbox: BBox) -> Optional[float]:
-    """Score of 0..~40 if `mark_bbox` is exactly where ``layout.place_one``
-    would have put an annotation for `field_bbox`; ``None`` otherwise.
+def _reverse_layout_score(mark_bbox: BBox, row: CRFRow) -> Optional[float]:
+    """Score of 0..~6 if `mark_bbox` is exactly where ``layout.place_row`` would
+    have put an annotation for `row`; ``None`` otherwise.
 
-    ``layout.place_one`` tries, in order, a box to the right of the field, then
-    below it, then to the left -- and if all three are blocked, walks the
-    *right* candidate straight down the page in fixed ``NUDGE`` steps. All
-    four shapes are cheap to reconstruct exactly: the mark's own bbox is
-    already the same width/height ``annotation_size(text)`` produced at
-    placement time, and ``GAP``/``NUDGE`` are fixed constants -- nothing here
-    is estimated. A lower score (fewer nudge steps) is a better match, used
-    only to break ties between multiple exact alignments; any exact alignment
-    still outranks every nearest-centroid fallback (see ``_CENTROID_OFFSET``).
+    Reconstructing that placement is nearly trivial, which is the payoff of
+    anchoring annotations to text instead of searching for a free spot. There are
+    only two shapes to check:
+
+    1. **On the row's baseline**, starting at ``anchor.x1 + GAP`` -- slot 1 -- or
+       further right for slot 2, which lands at an offset that depends on slot
+       1's rendered width and so is matched by "at or past the slot-1 x" rather
+       than an exact x.
+    2. **Wrapped below**, at the question's own indent ``anchor.x0``, some whole
+       number of ``LINE_STEP`` units down.
+
+    The old field-based version had four shapes to reconstruct (right, below,
+    left, then a forty-step downward walk) because placement was a search. A
+    lower score is a better match, used only to break ties; any exact alignment
+    outranks every nearest-centroid fallback (see ``_CENTROID_OFFSET``).
     """
-    w, h = mark_bbox.width, mark_bbox.height
-    right_x0, right_y0 = field_bbox.x1 + layout.GAP, field_bbox.y0
-    below_x0, below_y1 = field_bbox.x0, field_bbox.y0 - layout.GAP
-    left_x1, left_y0 = field_bbox.x0 - layout.GAP, field_bbox.y0
+    anchor = row.anchor
+    on_baseline_x0 = anchor.x1 + layout.GAP
 
-    if abs(mark_bbox.x0 - right_x0) <= _ALIGN_TOL and abs(mark_bbox.y0 - right_y0) <= _ALIGN_TOL:
-        return 0.0
-    if abs(mark_bbox.x0 - below_x0) <= _ALIGN_TOL and abs(mark_bbox.y1 - below_y1) <= _ALIGN_TOL:
-        return 0.0
-    if abs(mark_bbox.x1 - left_x1) <= _ALIGN_TOL and abs(mark_bbox.y0 - left_y0) <= _ALIGN_TOL:
-        return 0.0
+    if abs(mark_bbox.y0 - anchor.y0) <= _ALIGN_TOL:
+        if abs(mark_bbox.x0 - on_baseline_x0) <= _ALIGN_TOL:
+            return 0.0
+        # Slot 2 follows slot 1 on the same baseline. Its exact x depends on the
+        # width of text this function cannot see, so the test is "on this row's
+        # line, somewhere to the right of where slot 1 starts".
+        if mark_bbox.x0 > on_baseline_x0:
+            return 0.5
 
-    # Not a clean candidate -- check the nudged-right fallback: same x0 as
-    # the right candidate, y0 stepped down by a whole number of NUDGE units.
-    if abs(mark_bbox.x0 - right_x0) <= _ALIGN_TOL:
-        delta = right_y0 - mark_bbox.y0
+    # Wrapped: same indent as the question, a whole number of lines down.
+    if abs(mark_bbox.x0 - anchor.x0) <= _ALIGN_TOL:
+        delta = anchor.y0 - mark_bbox.y0
         if delta > 0:
-            k = delta / layout.NUDGE
-            if abs(k - round(k)) <= _NUDGE_TOL and 1 <= round(k) <= layout.MAX_NUDGES:
+            k = delta / layout.LINE_STEP
+            if abs(k - round(k)) <= _STEP_TOL and 1 <= round(k) <= layout.MAX_WRAPS:
                 return float(round(k))
     return None
 
 
-def _group_candidate_fields(fieldset: FieldSet) -> list[CRFField]:
-    """One synthetic field per ``group_id``, spanning its members' union bbox.
-
-    A mark describing a whole checkbox question (e.g. a Yes/No/Not Applicable
-    row) is drawn once beside the row, not beside any one option -- so it
-    naturally sits closer to the group's union bbox than to any single
-    option's small bbox off to one side. Adding these into the same
-    candidate pool :func:`match_marks_to_fields` scores against needs no
-    change to the matching algorithm itself; the union bbox just competes on
-    ordinary centroid distance like any other field. ``field_id`` carries a
-    ``grp_`` prefix -- the only signal a recovered mapping matched a group
-    rather than an individual option. Fields with no ``group_id`` (any
-    ``FieldSet`` predating this, or a page with no checkbox groups) produce
-    no candidates here, so this is a no-op unless grouping was detected.
-    """
-    members: dict[tuple[int, str], list[CRFField]] = {}
-    for f in fieldset.fields:
-        if f.group_id:
-            members.setdefault((f.page_index, f.group_id), []).append(f)
-
-    groups: list[CRFField] = []
-    for (page_index, group_id), fields in members.items():
-        groups.append(
-            CRFField(
-                field_id=f"grp_{group_id}",
-                page_index=page_index,
-                bbox=BBox(
-                    x0=min(f.bbox.x0 for f in fields),
-                    y0=min(f.bbox.y0 for f in fields),
-                    x1=max(f.bbox.x1 for f in fields),
-                    y1=max(f.bbox.y1 for f in fields),
-                ),
-                label=" / ".join(dict.fromkeys(f.label for f in fields if f.label)),
-                source=fields[0].source,
-                context=fields[0].context,
-                group_id=group_id,
-            )
-        )
-    return groups
-
-
-def match_marks_to_fields(
+def match_marks_to_rows(
     mappings: list[RecoveredMapping],
-    fieldset: FieldSet,
+    rows: RowSet,
     max_distance: float = DEFAULT_MAX_MATCH_DISTANCE,
 ) -> list[RecoveredMapping]:
-    """Re-attach each variable/note mark to the field(s) it most likely annotates.
+    """Re-attach each variable/note mark to the row it most likely annotates.
 
-    A domain banner covers a whole section, not one field, so it is never
-    matched. Candidate fields are every ``CRFField`` on the page plus one
-    synthetic candidate per checkbox group (:func:`_group_candidate_fields`).
-    Two tiers, per (mark, field) candidate pair on the same page:
+    A domain banner covers a whole page, not one row, so it is never matched.
+    Two tiers, per (mark, row) candidate pair on the same page:
 
     1. **Exact reverse-layout alignment** (:func:`_reverse_layout_score`) --
-       reconstructs ``layout.place_one``'s own placement math and asks "is
-       this mark exactly where that function would have put it for this
-       field?". For this pipeline's own output the answer is unambiguous and
-       essentially never coincidental, which is what makes a dense grid (many
-       same-size fields a few points apart, where centroid distance alone
-       regularly picks the neighbouring row) still resolve correctly.
-    2. **Nearest-centroid fallback** -- for anything with no exact alignment:
-       a third-party aCRF that was never positioned by this codebase's
-       ``layout.py``, or a pipeline-generated one a reviewer moved by hand in
-       Acrobat. Ranked behind every tier-1 match via ``_CENTROID_OFFSET`` so
-       an exact reconstruction is always preferred when one exists.
+       reconstructs ``layout.place_row``'s own arithmetic and asks "is this mark
+       exactly where that function would have put it for this row?". For this
+       pipeline's own output the answer is unambiguous.
+    2. **Nearest-row fallback** (:func:`_proximity`) -- for anything with no
+       exact alignment: a third-party aCRF that was never positioned by this
+       codebase, or one a reviewer moved by hand in Acrobat. Ranked behind every
+       tier-1 match via ``_CENTROID_OFFSET``.
 
-    Each mark keeps only its own single lowest-rank candidate. A field is
-    *not* retired once matched: one CRF field legitimately maps to more than
-    one SDTM variable (e.g. a single collected date populating both
-    ``DM.RFICDTC`` and ``DS.DSSTDTC``), so a field can end up matched by 0, 1,
-    or several marks. This is safe for tier-1 alignment, which is collision-
-    safe by construction -- two distinct fields cannot both satisfy
-    ``_reverse_layout_score`` against the same mark bbox, since that would
-    require identical field geometry. It is *not* defended for a tier-2-only
-    collision between two distinct, nearby fields with no exact alignment
-    evidence for either mark (a third-party aCRF never positioned by
-    ``layout.py``) -- resolving that would require comparing mark *text*,
-    which is not this function's job. ``match_distance`` makes a bad tier-2
-    guess visible to whoever reviews the report.
+    Each mark keeps only its own single lowest-rank candidate. A row is *not*
+    retired once matched: one CRF row legitimately carries more than one SDTM
+    variable (``AGE`` and ``AGEU``, and a single collected date populating both
+    ``DM.RFICDTC`` and ``DS.DSSTDTC``), so a row can end up matched by 0, 1, or
+    several marks -- which is exactly the ``anno1``/``anno2`` shape the control
+    sheet already has room for.
+
+    The tier-2 ambiguity that remains is narrower than it was. Rows are printed
+    lines, so candidates on a page are separated by a full line of leading rather
+    than by the few points that separated adjacent widgets in a grid; the case
+    where centroid distance picks the neighbour is correspondingly rarer.
+    ``match_distance`` still makes a bad tier-2 guess visible to whoever reviews
+    the report.
     """
-    all_fields = list(fieldset.fields) + _group_candidate_fields(fieldset)
-    fields_by_page: dict[int, list] = {}
-    for f in all_fields:
-        fields_by_page.setdefault(f.page_index, []).append(f)
+    rows_by_page: dict[int, list[CRFRow]] = {}
+    for row in rows.rows:
+        rows_by_page.setdefault(row.page_index, []).append(row)
 
-    # (rank, mark_index, field_id, reported_distance) -- `rank` decides match
-    # order (tier 1 always ahead of tier 2), `reported_distance` is the plain
-    # centroid distance in points, kept separately so an exact tier-1 match
-    # still reports a meaningful ``match_distance`` rather than a nudge count.
+    # (rank, mark_index, row_id, reported_distance) -- `rank` decides match order
+    # (tier 1 always ahead of tier 2) and is a wrap count or a clamped proximity;
+    # `reported_distance` is always plain centre-to-centre, kept separately so
+    # ``match_distance`` stays a single comparable number in the report whichever
+    # tier produced the match.
     candidates: list[tuple[float, int, str, float]] = []
     for i, m in enumerate(mappings):
         if m.kind == "domain":
             continue
-        for f in fields_by_page.get(m.page_index, []):
-            d = _distance(m.bbox, f.bbox)
-            aligned = _reverse_layout_score(m.bbox, f.bbox)
+        for row in rows_by_page.get(m.page_index, []):
+            d = _distance(m.bbox, row.anchor)
+            aligned = _reverse_layout_score(m.bbox, row)
             if aligned is not None:
-                candidates.append((aligned, i, f.field_id, d))
-            elif d <= max_distance:
-                candidates.append((d + _CENTROID_OFFSET, i, f.field_id, d))
+                candidates.append((aligned, i, row.row_id, d))
+            else:
+                near = _proximity(m.bbox, row.anchor)
+                if near <= max_distance:
+                    candidates.append((near + _CENTROID_OFFSET, i, row.row_id, d))
     candidates.sort(key=lambda t: t[0])
 
     chosen: dict[int, tuple[str, float]] = {}
-    for _rank, i, field_id, d in candidates:
+    for _rank, i, row_id, d in candidates:
         if i in chosen:
             continue
-        chosen[i] = (field_id, d)
+        chosen[i] = (row_id, d)
 
-    fields_by_id = {f.field_id: f for f in all_fields}
     out: list[RecoveredMapping] = []
     for i, m in enumerate(mappings):
         if i not in chosen:
             out.append(m)
             continue
-        field_id, dist = chosen[i]
-        field = fields_by_id[field_id]
+        row_id, dist = chosen[i]
+        row = rows.by_id(row_id)
+        assert row is not None
         out.append(
             replace(
                 m,
-                field_id=field_id,
-                label=field.label,
-                context=field.context,
+                row_id=row_id,
+                label=row.text_1 or row.text_2,
+                context=row_context(row),
                 match_distance=dist,
             )
         )
     return out
+
+
+def row_context(row: CRFRow) -> str:
+    """Disambiguating context for a matched row, for the lookup table.
+
+    Under the old design this was assembled from a section-heading search and a
+    same-line text scan, because a field's own geometry said nothing about what
+    it meant. A row already carries it: the form it belongs to, and its response
+    column, which is what separates the ``Result`` cell of the Systolic row from
+    the ``Result`` cell of the Pulse row.
+
+    Joined with '/' and ';', never '|'. This string travels as a CSV cell and, on
+    the markdown-table reply path, as a table cell, where a bare '|' silently
+    shifts every column after it.
+    """
+    parts = []
+    if row.form:
+        parts.append(f"form: {row.form}")
+    if row.text_2:
+        parts.append(f"response: {row.text_2}")
+    return "; ".join(parts)
 
 
 # --------------------------------------------------------------------------
@@ -586,7 +724,7 @@ def summarize_page_domains(
     """Append one derived "domain present" row per (page, domain).
 
     Must run *last*, after :func:`attribute_domains` and
-    :func:`match_marks_to_fields`, so it reflects each mark's final resolved
+    :func:`match_marks_to_rows`, so it reflects each mark's final resolved
     domain rather than raw annotation text -- this is what makes it a
     summary *derived from* what was actually found on the page, not a
     re-parsing of the page's own legend (see :func:`split_legend_marks`).
@@ -596,7 +734,7 @@ def summarize_page_domains(
     Reuses the existing ``kind="domain"`` value rather than inventing a new
     one, so a synthesized row is automatically excluded from
     :func:`to_lookup_rows` and would be excluded from ever re-entering
-    ``attribute_domains``/``match_marks_to_fields`` if this output were
+    ``attribute_domains``/``match_marks_to_rows`` if this output were
     accidentally re-run through them. ``legend_name`` is populated only when
     the page's own legend also named that domain code -- a cross-check for a
     reviewer, never the source of the domain itself.
@@ -638,11 +776,17 @@ def parse_annotated_pdf(
     """An already-annotated CRF -> best-effort recovered mappings.
 
     Pass ``blank_pdf_path`` (the un-annotated counterpart) when you have it --
-    field detection on a clean form is more reliable than detecting through
-    markup. Without it, fields are detected on ``pdf_path`` itself, which
-    works as long as the annotations were never flattened into page content
-    (this pipeline never flattens; see ``render.save_with_annotations`` --
-    but a third-party aCRF is not guaranteed to make the same choice).
+    row extraction on a clean form cannot confuse annotation text for form text.
+    Without it, rows are extracted from ``pdf_path`` itself.
+
+    That second case is worth being precise about, because it changed with the
+    row model. Annotations are FreeText *markup*, not page content, so
+    ``get_text("words")`` does not see them and the extracted rows are the
+    form's own text either way -- as long as nothing flattened the markup into
+    the page. This pipeline never flattens (see
+    ``render.save_with_annotations``); a third-party aCRF is not guaranteed to
+    make the same choice, and a flattened one will produce rows that include the
+    annotations, which then get matched against themselves.
 
     Pass ``precedent`` (a variable -> domain table, typically from
     ``pipeline.corpus_precedent.build_variable_domain_precedent``) to give
@@ -650,11 +794,14 @@ def parse_annotated_pdf(
     boxed banner and the built-in CDISC constants both leave unattributed.
     """
     marks = read_marks(pdf_path)
-    fieldset = extract_fields(blank_pdf_path or pdf_path)
-    legend_by_page, marks = split_legend_marks(marks, fieldset)
+    rows = extract_rows(blank_pdf_path or pdf_path)
+    # Built before the split, since split_legend_marks removes the very marks the
+    # colour key is read from.
+    legend_colors = legend_color_map(marks, rows)
+    legend_by_page, marks = split_legend_marks(marks, rows)
     mappings = [_mark_to_mapping(m) for m in marks]
-    mappings = attribute_domains(mappings, precedent)
-    mappings = match_marks_to_fields(mappings, fieldset, max_match_distance)
+    mappings = attribute_domains(mappings, precedent, legend_colors)
+    mappings = match_marks_to_rows(mappings, rows, max_match_distance)
     mappings = summarize_page_domains(mappings, legend_by_page)
     return mappings
 
@@ -680,7 +827,7 @@ def to_lookup_rows(mappings: list[RecoveredMapping]) -> list[dict]:
     """
     rows = []
     for m in mappings:
-        if m.kind != "variable" or m.field_id is None:
+        if m.kind != "variable" or m.row_id is None:
             continue
         rows.append(
             {
@@ -716,7 +863,7 @@ def write_lookup_csv(mappings: list[RecoveredMapping], out_path: str | Path) -> 
 
 REPORT_COLUMNS = [
     "page", "kind", "text", "domain", "variable", "condition", "fixed_value",
-    "domain_inferred", "domain_inference_source", "field_id", "label", "context",
+    "domain_inferred", "domain_inference_source", "row_id", "label", "context",
     "match_distance", "synthesized", "legend_name",
 ]
 
@@ -727,7 +874,7 @@ def to_report_rows(mappings: list[RecoveredMapping]) -> list[dict]:
     Unlike :func:`to_lookup_rows` -- which keeps only what's reusable as
     Copilot-prompt precedent -- this is the full audit view: domain banners,
     not-submitted notes, and anything that found no field within
-    ``max_match_distance`` all get a row, with ``field_id`` blank wherever a
+    ``max_match_distance`` all get a row, with ``row_id`` blank wherever a
     match failed. That blank is the signal to look at: a page-by-page count
     of it is the actual answer to "how much of this resolved cleanly".
     """
@@ -744,7 +891,7 @@ def to_report_rows(mappings: list[RecoveredMapping]) -> list[dict]:
                 "fixed_value": m.fixed_value or "",
                 "domain_inferred": m.domain_inferred,
                 "domain_inference_source": m.domain_inference_source or "",
-                "field_id": m.field_id or "",
+                "row_id": m.row_id or "",
                 "label": m.label or "",
                 "context": m.context or "",
                 "match_distance": round(m.match_distance, 1) if m.match_distance is not None else "",
@@ -775,8 +922,11 @@ __all__ = [
     "RawMark",
     "RecoveredMapping",
     "attribute_domains",
-    "match_marks_to_fields",
+    "classify_mark",
+    "legend_color_map",
+    "match_marks_to_rows",
     "parse_annotated_pdf",
+    "row_context",
     "parse_mapping_text",
     "read_marks",
     "split_legend_marks",

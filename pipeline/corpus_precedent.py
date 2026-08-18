@@ -40,12 +40,16 @@ import csv
 from collections import Counter, defaultdict
 from dataclasses import replace
 from pathlib import Path
+from typing import TYPE_CHECKING, Iterable
 
 from pipeline.parse_annotated_pdf import (
     DEFAULT_MAX_MATCH_DISTANCE,
     RecoveredMapping,
     parse_annotated_pdf,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - import only for type checkers
+    from pipeline.models import AnnotationSet, CRFRow, RowSet
 
 DEFAULT_MIN_SUPPORT = 2
 
@@ -149,7 +153,7 @@ def build_lookup_table(mappings: list[RecoveredMapping]) -> list[dict]:
     """
     grouped: dict[tuple, dict] = {}
     for m in mappings:
-        if m.kind != "variable" or m.field_id is None:
+        if m.kind != "variable" or m.row_id is None:
             continue
         key = _lookup_key(m)
         row = grouped.setdefault(
@@ -193,17 +197,147 @@ def write_corpus_lookup_csv(mappings: list[RecoveredMapping], out_path: str | Pa
 
 
 def read_corpus_lookup_csv(path: str | Path) -> list[dict]:
-    """Read a corpus lookup table back, e.g. for ``prompt.build_precedent_appendix``."""
+    """Read a corpus lookup table back, e.g. for :func:`match_precedent`."""
     with Path(path).open(encoding="utf-8") as fh:
         return list(csv.DictReader(fh))
+
+
+# --------------------------------------------------------------------------
+# Applying the table: pre-populating a control sheet
+# --------------------------------------------------------------------------
+#
+# The mined table is this pipeline's answer to the metadata repository a
+# better-resourced setup would look mappings up in. Same shape of join, and
+# notably the same *key*: CRF question text. A metadata repository holds the
+# standard text for each variable and matches an EDC form's question text
+# against it; here the corpus of previously-annotated CRFs plays that role, and
+# ``text_1`` is what keys into it.
+#
+# Everything matched this way is marked ``suggested`` -- the control sheet greys
+# those cells, so pre-populated and human-authored never look alike.
+
+
+def normalize_key(text: str) -> str:
+    """Fold CRF text to a lookup key.
+
+    Whitespace collapses (a PDF gives back words, not the source string, so the
+    spacing in a label never survives), a trailing colon goes, and case is
+    dropped. Anything more aggressive -- stripping punctuation, stemming --
+    starts matching questions that differ in ways that matter, and a wrong
+    pre-populated mapping costs a reviewer more than a blank cell.
+    """
+    return " ".join(text.split()).strip().rstrip(":").strip().lower()
+
+
+def build_precedent_index(lookup_rows: Iterable[dict]) -> dict[str, list[dict]]:
+    """``normalised label -> candidate mappings, best-supported first``.
+
+    A label with more than one candidate is real and worth keeping rather than
+    collapsing: the same question text genuinely maps differently across
+    studies. The best-supported one is proposed and the rest are named in the
+    proposal's rationale, so a reviewer can see there was a choice.
+    """
+    index: dict[str, list[dict]] = {}
+    for row in lookup_rows:
+        key = normalize_key(row.get("label", ""))
+        if not key:
+            continue
+        index.setdefault(key, []).append(row)
+    for candidates in index.values():
+        candidates.sort(key=lambda r: (-int(r.get("count") or 0), r.get("variable", "")))
+    return index
+
+
+def _candidate_keys(row: "CRFRow") -> list[str]:
+    """Lookup keys to try for a row, most specific first.
+
+    ``text_1`` alone is the usual key. The joined form is tried as well because
+    a row's meaning sometimes lives in the response column -- an option-only row
+    ("Female") has no question text at all, and for those ``text_2`` is the only
+    key there is.
+    """
+    keys = []
+    if row.text_1:
+        keys.append(normalize_key(row.text_1))
+    joined = normalize_key(row.joined_text())
+    if joined and joined not in keys:
+        keys.append(joined)
+    if not row.text_1 and row.text_2:
+        key = normalize_key(row.text_2)
+        if key not in keys:
+            keys.append(key)
+    return [k for k in keys if k]
+
+
+def match_precedent(
+    rows: "RowSet", lookup_rows: Iterable[dict], min_support: int = 1
+) -> "AnnotationSet":
+    """Propose an annotation for every row the mined corpus recognises.
+
+    Rows with no match get no annotation, which is deliberate: the control sheet
+    lists every extracted row regardless, so an unmatched row shows up as a blank
+    annotation cell for a human to fill rather than as a guess to un-guess.
+    """
+    from pipeline.models import AnnotationKind, AnnotationSet, SdtmAnnotation
+
+    index = build_precedent_index(lookup_rows)
+    out: list[SdtmAnnotation] = []
+
+    for row in rows.rows:
+        candidates: list[dict] = []
+        for key in _candidate_keys(row):
+            if key in index:
+                candidates = index[key]
+                break
+        if not candidates:
+            continue
+
+        best = candidates[0]
+        support = int(best.get("count") or 0)
+        if support < min_support:
+            continue
+
+        rationale = f"mined from {support} prior annotated CRF page(s)"
+        if len(candidates) > 1:
+            others = ", ".join(
+                f"{c.get('domain', '')}.{c.get('variable', '')} (n={c.get('count')})"
+                for c in candidates[1:4]
+            )
+            rationale += f"; competing precedent: {others}"
+
+        out.append(
+            SdtmAnnotation(
+                annot_id=f"{row.row_id}_a1",
+                row_id=row.row_id,
+                slot=1,
+                page_index=row.page_index,
+                bbox=row.anchor,
+                kind=AnnotationKind.VARIABLE,
+                domain=best.get("domain") or None,
+                variable=best.get("variable") or None,
+                condition=best.get("condition") or None,
+                fixed_value=best.get("fixed_value") or None,
+                # No confidence score: support count is real, but any mapping of
+                # it onto 0..1 would be invented, and an invented confidence is
+                # worse than an honest absence.
+                rationale=rationale,
+                source_model=f"mined precedent (n={support})",
+                suggested=True,
+            )
+        )
+
+    return AnnotationSet(source_pdf=rows.source_pdf, pages=rows.pages, annotations=out)
 
 
 __all__ = [
     "CORPUS_LOOKUP_COLUMNS",
     "DEFAULT_MIN_SUPPORT",
     "build_lookup_table",
+    "build_precedent_index",
     "build_variable_domain_precedent",
+    "match_precedent",
     "mine_corpus",
+    "normalize_key",
     "read_corpus_lookup_csv",
     "write_corpus_lookup_csv",
 ]

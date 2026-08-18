@@ -15,13 +15,13 @@ import pymupdf
 import pytest
 
 from pipeline import layout, xfdf
-from pipeline.extract import extract_fields
-from pipeline.models import AnnotationSet, BBox, PageGeometry
+from pipeline.rows import extract_rows
+from pipeline.models import NOT_SUBMITTED_TEXT, AnnotationSet, BBox, PageGeometry
 from pipeline.parse_annotated_pdf import (
     RawMark,
     RecoveredMapping,
     attribute_domains,
-    match_marks_to_fields,
+    match_marks_to_rows,
     parse_annotated_pdf,
     parse_mapping_text,
     read_marks,
@@ -33,7 +33,13 @@ from pipeline.parse_annotated_pdf import (
 )
 from pipeline.parse_response import ingest_response_file
 from pipeline.prompt import write_batches
-from pipeline.render import draw_annotation, save_with_annotations
+from pipeline.msg import apply_colors, page_color_map
+from pipeline.render import (
+    draw_annotation,
+    draw_legend,
+    legend_origin,
+    save_with_annotations,
+)
 from pipeline.xfdf_to_pdf import xfdf_to_pdf
 from standin_response import build_response
 
@@ -69,9 +75,9 @@ def hand_built_pdf(tmp_path):
     """One page with a domain banner, a plain variable mark, and a muted note mark."""
     doc = pymupdf.open()
     page = doc.new_page(width=612, height=792)
-    draw_annotation(page, BBox(x0=50, y0=700, x1=90, y1=712), "VS", boxed=True)
+    draw_annotation(page, BBox(x0=50, y0=700, x1=90, y1=712), "VS", bordered=True)
     draw_annotation(page, BBox(x0=50, y0=650, x1=110, y1=662), "VSORRES when VSTESTCD = SYSBP")
-    draw_annotation(page, BBox(x0=50, y0=600, x1=130, y1=612), "[Not Submitted]", muted=True)
+    draw_annotation(page, BBox(x0=50, y0=600, x1=130, y1=612), NOT_SUBMITTED_TEXT, muted=True)
     out = tmp_path / "hand_built.pdf"
     save_with_annotations(doc, out)
     doc.close()
@@ -84,8 +90,8 @@ def test_read_marks_classifies_boxed_and_muted(hand_built_pdf):
     assert marks["VS"].muted is False
     assert marks["VSORRES when VSTESTCD = SYSBP"].boxed is False
     assert marks["VSORRES when VSTESTCD = SYSBP"].muted is False
-    assert marks["[Not Submitted]"].muted is True
-    assert marks["[Not Submitted]"].boxed is False
+    assert marks[NOT_SUBMITTED_TEXT].muted is True
+    assert marks[NOT_SUBMITTED_TEXT].boxed is False
 
 
 def test_read_marks_skips_empty_annotations(tmp_path):
@@ -103,12 +109,12 @@ def test_read_marks_skips_empty_annotations(tmp_path):
 
 def test_fixed_value_mark_is_recovered_and_exported(crfs, tmp_path):
     """DSCAT = PROTOCOL MILESTONE -- a constant, not a row-selecting condition."""
-    fieldset = extract_fields(crfs["acroform"])
-    field = fieldset.fields[0]
+    rowset = extract_rows(crfs["acroform"])
+    row = rowset.rows[0]
 
     doc = pymupdf.open()
     page = doc.new_page(width=612, height=792)
-    draw_annotation(page, field.bbox, "DSCAT = PROTOCOL MILESTONE")
+    draw_annotation(page, row.anchor, "DSCAT = PROTOCOL MILESTONE")
     out = tmp_path / "fixed_value.pdf"
     save_with_annotations(doc, out)
     doc.close()
@@ -151,7 +157,7 @@ def test_domain_attribution_ignores_a_banner_below_the_mark(tmp_path):
     doc = pymupdf.open()
     page = doc.new_page(width=612, height=792)
     draw_annotation(page, BBox(x0=50, y0=650, x1=110, y1=662), "RESULT")
-    draw_annotation(page, BBox(x0=50, y0=600, x1=90, y1=612), "VS", boxed=True)  # below the mark
+    draw_annotation(page, BBox(x0=50, y0=600, x1=90, y1=612), "VS", bordered=True)  # below the mark
     out = tmp_path / "below.pdf"
     save_with_annotations(doc, out)
     doc.close()
@@ -222,8 +228,8 @@ def test_banner_wins_over_a_conflicting_precedent_entry(hand_built_pdf):
 
 
 def test_page_legend_is_excluded_from_field_mappings(crfs, tmp_path):
-    fieldset = extract_fields(crfs["acroform"])
-    top = max(f.bbox.y1 for f in fieldset.for_page(0))
+    rowset = extract_rows(crfs["acroform"])
+    top = max(r.anchor.y1 for r in rowset.for_page(0))
 
     doc = pymupdf.open()
     page = doc.new_page(width=612, height=792)
@@ -234,7 +240,7 @@ def test_page_legend_is_excluded_from_field_mappings(crfs, tmp_path):
     doc.close()
 
     marks = read_marks(out)
-    legend_by_page, remaining = split_legend_marks(marks, fieldset)
+    legend_by_page, remaining = split_legend_marks(marks, rowset)
     assert legend_by_page == {0: {"DS": "Disposition"}}
     assert remaining == []
 
@@ -243,8 +249,8 @@ def test_same_shaped_text_in_field_territory_is_not_treated_as_a_legend(crfs, tm
     """DSCAT = PROTOCOL MILESTONE has the same 'CODE = phrase' shape as a
     legend, but sits among the fields, not above all of them -- position,
     not text shape, is what has to tell the two apart."""
-    fieldset = extract_fields(crfs["acroform"])
-    top = max(f.bbox.y1 for f in fieldset.for_page(0))
+    rowset = extract_rows(crfs["acroform"])
+    top = max(r.anchor.y1 for r in rowset.for_page(0))
 
     doc = pymupdf.open()
     page = doc.new_page(width=612, height=792)
@@ -256,21 +262,21 @@ def test_same_shaped_text_in_field_territory_is_not_treated_as_a_legend(crfs, tm
     doc.close()
 
     marks = read_marks(out)
-    legend_by_page, remaining = split_legend_marks(marks, fieldset)
+    legend_by_page, remaining = split_legend_marks(marks, rowset)
     assert legend_by_page == {}
     assert len(remaining) == 1
     assert remaining[0].text == "DSCAT = PROTOCOL MILESTONE"
 
 
 def test_page_domain_summary_is_derived_from_resolved_mappings_not_legend_text(crfs, tmp_path):
-    fieldset = extract_fields(crfs["acroform"])
-    page0 = fieldset.for_page(0)
+    rowset = extract_rows(crfs["acroform"])
+    page0 = rowset.for_page(0)
     f1, f2 = page0[0], page0[1]
 
     doc = pymupdf.open()
     page = doc.new_page(width=612, height=792)
-    draw_annotation(page, f1.bbox, "DM.SEX")
-    draw_annotation(page, f2.bbox, "DSTERM")  # bare -- resolves to DS via builtin fallback
+    draw_annotation(page, f1.anchor, "DM.SEX")
+    draw_annotation(page, f2.anchor, "DSTERM")  # bare -- resolves to DS via builtin fallback
     out = tmp_path / "two_domains.pdf"
     save_with_annotations(doc, out)
     doc.close()
@@ -280,19 +286,19 @@ def test_page_domain_summary_is_derived_from_resolved_mappings_not_legend_text(c
     assert set(summaries) == {"DM", "DS"}
     for s in summaries.values():
         assert s.kind == "domain"
-        assert s.field_id is None
+        assert s.row_id is None
         assert s.legend_name is None  # no legend was drawn on this page
 
 
 def test_page_domain_summary_cross_checks_against_the_legend(crfs, tmp_path):
-    fieldset = extract_fields(crfs["acroform"])
-    f1 = fieldset.for_page(0)[0]
-    top = max(f.bbox.y1 for f in fieldset.for_page(0))
+    rowset = extract_rows(crfs["acroform"])
+    f1 = rowset.for_page(0)[0]
+    top = max(r.anchor.y1 for r in rowset.for_page(0))
 
     doc = pymupdf.open()
     page = doc.new_page(width=612, height=792)
     draw_annotation(page, BBox(x0=50, y0=top + 20, x1=170, y1=top + 32), "DM=Demographics")
-    draw_annotation(page, f1.bbox, "DM.SEX")
+    draw_annotation(page, f1.anchor, "DM.SEX")
     out = tmp_path / "legend_crosscheck.pdf"
     save_with_annotations(doc, out)
     doc.close()
@@ -305,8 +311,8 @@ def test_page_domain_summary_cross_checks_against_the_legend(crfs, tmp_path):
 # --- spatial matching ---------------------------------------------------------
 
 
-def test_unmatched_mark_has_no_field_id_and_is_excluded_from_the_lookup_table(crfs):
-    fieldset = extract_fields(crfs["acroform"])
+def test_unmatched_mark_has_no_row_id_and_is_excluded_from_the_lookup_table(crfs):
+    rowset = extract_rows(crfs["acroform"])
     from pipeline.parse_annotated_pdf import RecoveredMapping
 
     far_away = RecoveredMapping(
@@ -317,170 +323,250 @@ def test_unmatched_mark_has_no_field_id_and_is_excluded_from_the_lookup_table(cr
         domain="DM",
         variable="SEX",
     )
-    matched = match_marks_to_fields([far_away], fieldset, max_distance=5.0)
-    assert matched[0].field_id is None
+    matched = match_marks_to_rows([far_away], rowset, max_distance=5.0)
+    assert matched[0].row_id is None
     assert matched[0].match_distance is None
     assert to_lookup_rows(matched) == []
 
 
-def test_domain_banner_is_never_matched_to_a_field(crfs):
-    fieldset = extract_fields(crfs["acroform"])
+def test_domain_banner_is_never_matched_to_a_row(crfs):
+    rowset = extract_rows(crfs["acroform"])
     from pipeline.parse_annotated_pdf import RecoveredMapping
 
-    field = fieldset.fields[0]
+    row = rowset.rows[0]
     banner = RecoveredMapping(
-        page_index=field.page_index, bbox=field.bbox, text="DM", kind="domain", domain="DM"
+        page_index=row.page_index, bbox=row.anchor, text="DM", kind="domain", domain="DM"
     )
-    matched = match_marks_to_fields([banner], fieldset)
-    assert matched[0].field_id is None
+    matched = match_marks_to_rows([banner], rowset)
+    assert matched[0].row_id is None
 
 
-def test_two_marks_can_share_one_field(crfs):
-    """One collected date can populate two SDTM variables in two domains --
-    used_fields exclusivity used to forbid this; removing it should not."""
-    fieldset = extract_fields(crfs["acroform"])
-    field = fieldset.fields[0]
-    page_geom = fieldset.pages[field.page_index]
+def test_two_marks_can_share_one_row(crfs):
+    """One CRF row legitimately carries two SDTM variables.
 
-    box1 = layout.place_one(field.bbox, "DM.RFICDTC", page_geom, obstacles=[])
-    box2 = layout.place_one(field.bbox, "DS.DSSTDTC", page_geom, obstacles=[box1])
+    A single collected date populating both DM.RFICDTC and DS.DSSTDTC, or the
+    AGE / AGEU pair -- which is exactly the anno1/anno2 shape the control sheet
+    has room for, so a row must not be retired once matched.
+    """
+    rowset = extract_rows(crfs["acroform"])
+    row = rowset.rows[0]
+    page_geom = rowset.pages[row.page_index]
+
+    box1, box2 = layout.place_row(
+        row.anchor, ["DM.RFICDTC", "DS.DSSTDTC"], page_geom,
+        limit=layout.right_limit(row, page_geom), obstacles=[],
+    )
 
     m1 = RecoveredMapping(
-        page_index=field.page_index, bbox=box1, text="DM.RFICDTC",
+        page_index=row.page_index, bbox=box1, text="DM.RFICDTC",
         kind="variable", domain="DM", variable="RFICDTC",
     )
     m2 = RecoveredMapping(
-        page_index=field.page_index, bbox=box2, text="DS.DSSTDTC",
+        page_index=row.page_index, bbox=box2, text="DS.DSSTDTC",
         kind="variable", domain="DS", variable="DSSTDTC",
     )
 
-    matched = match_marks_to_fields([m1, m2], fieldset)
-    assert matched[0].field_id == field.field_id
-    assert matched[1].field_id == field.field_id
+    matched = match_marks_to_rows([m1, m2], rowset)
+    assert matched[0].row_id == row.row_id
+    assert matched[1].row_id == row.row_id
     assert {m.variable for m in matched} == {"RFICDTC", "DSSTDTC"}
 
 
-def test_two_adjacent_fields_each_keep_their_own_mark(crfs):
-    """Dense-grid regression guard: removing used_fields must not let two
-    distinct nearby fields' marks bleed into each other. Both marks here are
-    exact reverse-layout alignments (tier 1), which is collision-safe by
-    construction -- this pins that down directly rather than relying only on
-    the full round-trip fixture below."""
-    fieldset = extract_fields(crfs["acroform"])
-    f1, f2 = fieldset.for_page(0)[0], fieldset.for_page(0)[1]
-    page_geom = fieldset.pages[0]
+def test_two_adjacent_rows_each_keep_their_own_mark(crfs):
+    """Two nearby rows' marks must not bleed into each other.
 
-    box1 = layout.place_one(f1.bbox, "DM.SITEID", page_geom, obstacles=[])
-    box2 = layout.place_one(f2.bbox, "DM.USUBJID", page_geom, obstacles=[box1])
+    Both marks here are exact reverse-layout alignments (tier 1), which is
+    collision-safe by construction. Rows are a full line of leading apart rather
+    than the few points that separated adjacent widgets in a grid, so this is a
+    weaker requirement than it used to be -- but it is the requirement that
+    stopped a dense VS grid resolving to the neighbouring row, so it stays.
+    """
+    rowset = extract_rows(crfs["acroform"])
+    r1, r2 = rowset.for_page(0)[0], rowset.for_page(0)[1]
+    page_geom = rowset.pages[0]
+
+    (box1,) = layout.place_row(
+        r1.anchor, ["DM.SITEID"], page_geom,
+        limit=layout.right_limit(r1, page_geom), obstacles=[],
+    )
+    (box2,) = layout.place_row(
+        r2.anchor, ["DM.USUBJID"], page_geom,
+        limit=layout.right_limit(r2, page_geom), obstacles=[box1],
+    )
 
     m1 = RecoveredMapping(page_index=0, bbox=box1, text="DM.SITEID", kind="variable", domain="DM", variable="SITEID")
     m2 = RecoveredMapping(page_index=0, bbox=box2, text="DM.USUBJID", kind="variable", domain="DM", variable="USUBJID")
 
-    matched = match_marks_to_fields([m1, m2], fieldset)
+    matched = match_marks_to_rows([m1, m2], rowset)
     by_variable = {m.variable: m for m in matched}
-    assert by_variable["SITEID"].field_id == f1.field_id
-    assert by_variable["USUBJID"].field_id == f2.field_id
+    assert by_variable["SITEID"].row_id == r1.row_id
+    assert by_variable["USUBJID"].row_id == r2.row_id
 
 
-# --- checkbox-group matching --------------------------------------------------
+# --- question row vs its option rows ----------------------------------------
 
 
-def test_mark_beside_a_checkbox_row_matches_the_whole_group_not_one_option(crfs, tmp_path):
-    """DM_SEX_M/DM_SEX_F -- a 2-member row -- rather than the 3-member VS
-    Position row: an odd-count, evenly-spaced row's middle option sits at
-    exactly the same centroid as the row's own union bbox, which would tie
-    (not merely resolve) the very distance comparison this test checks."""
-    fieldset = extract_fields(crfs["acroform"])
-    members = [f for f in fieldset.fields if f.field_id in ("DM_SEX_M", "DM_SEX_F")]
-    assert len(members) == 2
-    group_ids = {f.group_id for f in members}
-    assert len(group_ids) == 1 and None not in group_ids
-    group_id = members[0].group_id
+def test_mark_beside_a_question_matches_it_not_the_option_row_below(crfs, tmp_path):
+    """The ambiguity that survives the move to rows.
 
-    x0 = min(f.bbox.x0 for f in members)
-    x1 = max(f.bbox.x1 for f in members)
-    y1 = max(f.bbox.y1 for f in members)
-    mid_x = (x0 + x1) / 2.0
+    Under the old field model a Yes/No question needed a *synthetic group* field
+    spanning both option widgets, because a mark beside the question was closer
+    to the group's union bbox than to either individual checkbox. The row model
+    deletes that machinery: the question row already carries the question text,
+    and the option below it is a separate row with an empty question half.
 
-    # Annotate the real blank CRF's own page directly, so the mark's
-    # page_index lines up with the fields it needs to compete against -- a
-    # throwaway single-page doc would always put the mark on page 0.
+    What remains is telling those two rows apart -- the question row and its
+    option-only continuation -- which is what this pins down. They sit one line
+    of leading apart, so a mark on the question's own baseline is the question's.
+    """
+    rowset = extract_rows(crfs["acroform"])
+    question = next(
+        r for r in rowset.rows if r.text_1.startswith("Was this participant a prior")
+    )
+    # The continuation row: same question, next option, no question text.
+    option = next(
+        r
+        for r in rowset.rows
+        if r.page_index == question.page_index
+        and not r.text_1
+        and r.anchor.y1 < question.anchor.y1
+    )
+    assert option.text_2, "expected an option-only row under the question"
+
+    page_geom = rowset.pages[question.page_index]
+    (box,) = layout.place_row(
+        question.anchor,
+        ['SUPPDM.QVAL when QNAM="RESCREEN"'],
+        page_geom,
+        limit=layout.right_limit(question, page_geom),
+        obstacles=[],
+    )
+
+    # Annotate the real blank CRF's own page directly, so the mark's page_index
+    # lines up with the rows it has to compete against -- a throwaway
+    # single-page doc would always put the mark on page 0.
     doc = pymupdf.open(crfs["acroform"])
-    page = doc[members[0].page_index]
-    # Centered above the row's midpoint, which coincides with neither
-    # option's own centroid -- unambiguously closer to the group.
-    mark_bbox = BBox(x0=mid_x - 25, y0=y1 + 6, x1=mid_x + 25, y1=y1 + 16)
-    draw_annotation(page, mark_bbox, 'SUPPDM.QVAL when QNAM="SEX"')
-    out = tmp_path / "checkbox_group.pdf"
+    page = doc[question.page_index]
+    draw_annotation(page, box, 'SUPPDM.QVAL when QNAM="RESCREEN"')
+    out = tmp_path / "question_row.pdf"
     save_with_annotations(doc, out)
     doc.close()
 
     mappings = parse_annotated_pdf(out, crfs["acroform"])
     variable = next(m for m in mappings if m.kind == "variable")
-    assert variable.field_id == f"grp_{group_id}"
+    assert variable.row_id == question.row_id, (
+        f"matched {variable.row_id} instead of the question row {question.row_id}"
+    )
+    assert variable.label == question.text_1
 
 
 # --- full-loop round trip: this pipeline's own convention, end to end -------
 
 
 @pytest.fixture(scope="module")
-def fieldset(crfs):
-    return extract_fields(crfs["acroform"])
+def rowset(crfs):
+    return extract_rows(crfs["acroform"])
 
 
 @pytest.fixture(scope="module")
-def annotated_pdf(crfs, fieldset, tmp_path_factory):
-    """extract -> batch -> stand-in reply -> ingest -> layout -> xfdf -> final PDF."""
+def annotated_pdf(crfs, rowset, tmp_path_factory):
+    """rows -> batch -> stand-in reply -> ingest -> colour -> layout -> final PDF.
+
+    The MSG legend is drawn, because under MSG styling it is the only thing on the
+    page that names a domain: annotations read ``VSORRES``, not ``VS.VSORRES``.
+    Omitting it would make this fixture unrepresentative of real output *and*
+    quietly stop exercising ``legend_color_map``.
+    """
     tmp = tmp_path_factory.mktemp("annotated")
-    manifest = write_batches(fieldset, tmp)
+    manifest = write_batches(rowset, tmp)
 
     collected = []
     for entry in manifest:
         reply = tmp / f"resp-batch{entry['batch']}.csv"
-        reply.write_text(build_response(fieldset, entry["pages"]), encoding="utf-8")
-        collected.extend(ingest_response_file(reply, fieldset, entry["pages"]).annotations)
+        reply.write_text(build_response(rowset, entry["pages"]), encoding="utf-8")
+        collected.extend(ingest_response_file(reply, rowset, entry["pages"]).annotations)
 
-    annots = AnnotationSet(source_pdf=fieldset.source_pdf, pages=fieldset.pages, annotations=collected)
-    placed = layout.place_annotations(annots, fieldset, obstacles=layout.text_obstacles(crfs["acroform"]))
-    xfdf_path = xfdf.write_xfdf(placed, tmp / "blankcrf.xfdf")
-    final = xfdf_to_pdf(crfs["acroform"], xfdf_path, tmp / "annotated.pdf")
+    annots = AnnotationSet(source_pdf=rowset.source_pdf, pages=rowset.pages, annotations=collected)
+    annots = apply_colors(annots, rowset)
+    placed = layout.place_annotations(annots, rowset, obstacles=layout.text_obstacles(crfs["acroform"]))
+
+    final = tmp / "annotated.pdf"
+    doc = pymupdf.open(crfs["acroform"])
+    try:
+        for a in placed.submittable():
+            text = a.display_text()
+            if text:
+                draw_annotation(
+                    doc[a.page_index], a.bbox, text,
+                    fill=a.color, dashed=a.kind.value == "note",
+                )
+        for page_index, colors in page_color_map(placed, rowset).items():
+            page = doc[page_index]
+            draw_legend(
+                page,
+                [(f"{code} (Domain {code})", rgb) for code, rgb in colors.items()],
+                origin=legend_origin(page),
+            )
+        save_with_annotations(doc, final)
+    finally:
+        doc.close()
     return final, placed
 
 
-def test_every_placed_annotation_is_recovered_and_matched(crfs, fieldset, annotated_pdf):
-    """The headline claim: point this at this pipeline's own output and it round-trips."""
+def test_every_placed_annotation_is_recovered_and_matched(crfs, rowset, annotated_pdf):
+    """The headline claim: point this at this pipeline's own output and it round-trips.
+
+    Compared against the annotations that were actually *drawn*. An annotation
+    with no text -- a row the stand-in reply had no mapping for -- leaves no mark
+    on the page, so there is nothing for recovery to find and nothing it should
+    invent.
+    """
     final, placed = annotated_pdf
     mappings = parse_annotated_pdf(final, crfs["acroform"])
 
+    drawn = [a for a in placed.annotations if a.display_text()]
     non_domain = [m for m in mappings if m.kind != "domain"]
-    assert len(non_domain) == len(placed.annotations)
-    unmatched = [m for m in non_domain if m.field_id is None]
-    assert unmatched == [], f"expected every mark to match a field, got unmatched: {unmatched}"
+    assert len(non_domain) == len(drawn)
+    unmatched = [m for m in non_domain if m.row_id is None]
+    assert unmatched == [], f"expected every mark to match a row, got unmatched: {unmatched}"
 
 
-def test_recovered_mappings_agree_with_the_originals(crfs, fieldset, annotated_pdf):
+def test_recovered_mappings_agree_with_the_originals(crfs, rowset, annotated_pdf):
+    """Keyed on (row_id, variable), not row_id alone.
+
+    One row legitimately carries two variables -- AGE and AGEU on the same
+    printed line -- so a row_id-keyed dict would silently drop one of them and
+    the test would then pass by comparing an annotation against itself.
+    """
     final, placed = annotated_pdf
     mappings = parse_annotated_pdf(final, crfs["acroform"])
-    recovered_by_field = {m.field_id: m for m in mappings if m.field_id is not None}
+    recovered = {
+        (m.row_id, m.variable): m for m in mappings if m.row_id is not None
+    }
 
     checked = 0
     for original in placed.annotations:
-        recovered = recovered_by_field.get(original.field_id)
-        assert recovered is not None, f"{original.field_id} was not matched to any mark"
-        assert recovered.domain == original.domain
-        assert recovered.variable == original.variable
-        assert recovered.condition == original.condition
+        if not original.display_text():
+            continue  # never drawn, so nothing to recover
+        got = recovered.get((original.row_id, original.variable))
+        assert got is not None, (
+            f"{original.row_id}/{original.variable} was not matched to any mark"
+        )
+        # The domain is recovered from the page legend's colour key, not from the
+        # mark's own text -- MSG annotations do not carry a domain prefix.
+        assert got.domain == original.domain, (
+            f"{original.row_id}: domain {got.domain!r} != {original.domain!r}"
+        )
+        assert got.condition == original.condition
         checked += 1
-    assert checked == len(placed.annotations)
+    assert checked == len([a for a in placed.annotations if a.display_text()])
 
 
 def test_not_submitted_fields_recover_as_muted_notes_with_no_variable(crfs, annotated_pdf):
     final, placed = annotated_pdf
     mappings = parse_annotated_pdf(final, crfs["acroform"])
 
-    from pipeline.parse_annotated_pdf import NOT_SUBMITTED_TEXT
-
-    notes = [m for m in mappings if m.text == NOT_SUBMITTED_TEXT]
+    notes = [m for m in mappings if m.text.upper() == NOT_SUBMITTED_TEXT.upper()]
     assert notes, "fixture should contain at least one not-submitted field"
     for n in notes:
         assert n.kind == "note"
@@ -497,7 +583,7 @@ def test_lookup_csv_round_trips_through_a_file(crfs, annotated_pdf, tmp_path):
 
     with out.open(encoding="utf-8") as fh:
         rows = list(csv_module.DictReader(fh))
-    matched_variable = [m for m in mappings if m.kind == "variable" and m.field_id is not None]
+    matched_variable = [m for m in mappings if m.kind == "variable" and m.row_id is not None]
     assert len(rows) == len(matched_variable)
     assert rows[0]["label"]  # every matched field has a caption in this fixture
 
@@ -507,7 +593,7 @@ def test_lookup_csv_round_trips_through_a_file(crfs, annotated_pdf, tmp_path):
 
 def test_report_has_one_row_per_mark_including_unmatched(crfs):
     """Unlike the lookup table, the report keeps a row even when matching fails."""
-    fieldset = extract_fields(crfs["acroform"])
+    rowset = extract_rows(crfs["acroform"])
     from pipeline.parse_annotated_pdf import RecoveredMapping
 
     unmatched = RecoveredMapping(
@@ -518,10 +604,10 @@ def test_report_has_one_row_per_mark_including_unmatched(crfs):
         domain="DM",
         variable="SEX",
     )
-    matched = match_marks_to_fields([unmatched], fieldset, max_distance=5.0)
+    matched = match_marks_to_rows([unmatched], rowset, max_distance=5.0)
     rows = to_report_rows(matched)
     assert len(rows) == 1
-    assert rows[0]["field_id"] == ""
+    assert rows[0]["row_id"] == ""
     assert rows[0]["domain"] == "DM"
     assert rows[0]["variable"] == "SEX"
 
@@ -538,7 +624,7 @@ def test_report_csv_has_a_row_for_every_recovered_mark(crfs, annotated_pdf, tmp_
     assert len(rows) == len(mappings)
     # Every *real* mark in this fixture matches, so the report should show no
     # gaps there -- but summarize_page_domains' derived page-level summaries
-    # describe the page as a whole and never carry a field_id by design.
+    # describe the page as a whole and never carry a row_id by design.
     non_summary = [r for r in rows if r["synthesized"] != "True"]
     assert non_summary, "fixture should contain at least one non-summary row"
-    assert all(r["field_id"] for r in non_summary)
+    assert all(r["row_id"] for r in non_summary)

@@ -1,4 +1,13 @@
 pymupdf            # PDF engine: extraction, geometry, stamping (AGPL-3.0, cleared for this node)
 pydantic>=2        # typed annotation records, validation at the parse boundary
+openpyxl>=3.1      # the XLSX control sheet -- where a human reviews annotations
 dash>=2.18         # review UI (later phase)
 dash-ag-grid>=31.2 # review UI (later phase)
+
+# Deliberately absent:
+#   pdfminer.six  -- PyMuPDF does the text extraction, and better: it is already
+#                    the engine for geometry, stamping and rendering, so adding a
+#                    second PDF parser would mean two coordinate conventions.
+#   pillow (PIL)  -- only ever wanted for measuring annotation text width, which
+#                    pymupdf.get_text_length already does against the font that
+#                    actually gets embedded in the output rather than a system one.

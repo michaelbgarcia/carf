@@ -1,5 +1,27 @@
 # carf — Code Documentation & Python Field Guide
 
+> ## ⚠️ Partly stale as of the two-column rewrite
+>
+> The pipeline was rebuilt around the two-column row model (see the top-level
+> [README.md](../README.md)). These per-file docs were written against the
+> earlier field-detection design and have **not** been rewritten. Treat the
+> source and its docstrings as authoritative until they are.
+>
+> | doc | status |
+> |---|---|
+> | `pipeline/geometry.md` | **current** — `geometry.py` is unchanged |
+> | `pipeline/xfdf_to_pdf.md` | mostly current; XFDF is now an export path, not the review surface, and rendering takes `fill`/`dashed` rather than `boxed`/`muted` |
+> | `pipeline/models.md` | **stale** — `CRFField`/`FieldSet` are now `CRFRow`/`RowSet`, `field_id` is `row_id`, and `SdtmAnnotation` gained `slot`, `text`, `color`, `suggested` |
+> | `pipeline/layout.md` | **stale** — the three-candidate collision search it describes is gone; placement is arithmetic off each row's anchor |
+> | `pipeline/render.md` | **stale** — MSG fills, dashed note borders and the page legend are new |
+> | `pipeline/prompt.md`, `pipeline/parse_response.md` | **stale** — retargeted to `row_id`, and Copilot is now the gap filler rather than the mapping source |
+> | `pipeline/stamp.md`, `pipeline/xfdf.md`, `pipeline/__init__.md` | **stale** in their model references |
+> | `pipeline/extract.md` | **deleted** — `extract.py` no longer exists |
+>
+> Undocumented entirely: `pipeline/text.py`, `pipeline/rows.py`,
+> `pipeline/msg.py`, `pipeline/control_sheet.py`,
+> `pipeline/corpus_precedent.py`, `pipeline/parse_annotated_pdf.py`.
+
 This `docs/` folder documents **every source file in the repository**, function by
 function, in plain language — plus notes on the Python language features each
 file demonstrates, since this project doubles as a decent tour of "real world"

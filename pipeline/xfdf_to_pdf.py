@@ -1,6 +1,8 @@
-"""XFDF + blank CRF -> submission-ready annotated PDF.
+"""XFDF + blank CRF -> annotated PDF.
 
-Task order step 9. The last step in the pipeline.
+The Acrobat-side counterpart to ``scripts/annotate.py``. The normal route to a
+submission artifact reads the reviewed XLSX control sheet; this one exists for a
+reviewer who worked in Acrobat instead, and renders their edits back out.
 
 **PyMuPDF has no XFDF importer.** There is no ``pymupdf.import_xfdf()``; XFDF
 import/export is an Acrobat / pdf-lib ecosystem feature, not something the
@@ -12,9 +14,10 @@ The XFDF is authoritative
 By this point the file has been through human review and may have been edited
 in Acrobat. Everything rendered comes from the XFDF: ``@rect`` for position,
 ``<contents>`` for text, verbatim. This module deliberately does **not**
-consult ``fields.json`` or ``proposals.json`` -- reintroducing pre-review data
-as a filter or as a source of text would quietly undo the review. If a human
-retyped an annotation, that retyped text is what gets rendered.
+consult ``rows.json``, ``proposals.json`` or the control sheet -- reintroducing
+pre-review data as a filter or as a source of text would quietly undo the
+review. If a human retyped an annotation, that retyped text is what gets
+rendered.
 
 Coordinates
 -----------
@@ -67,15 +70,47 @@ class XfdfAnnotation:
     text: str
     kind: str = "variable"
     muted: bool = False
+    #: MSG background fill recovered from ``@color``, 0-255 per channel. ``None``
+    #: for an annotation written under the older no-fill convention, or one whose
+    #: colour a reviewer replaced with something unparseable.
+    fill: tuple[int, int, int] | None = None
     meta: dict[str, str] = dc_field(default_factory=dict)
 
     @property
     def review_status(self) -> str:
         return self.meta.get("review_status", "")
 
+    @property
+    def row_id(self) -> str:
+        """The join key, when it survived the round trip through Acrobat.
+
+        Empty string when it did not. Nothing in rendering depends on it -- see
+        ``xfdf.py`` on why ``<carf:meta>`` is a convenience, not a contract."""
+        return self.meta.get("row_id", "")
+
 
 def _localname(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
+
+
+def _parse_hex(value: str | None) -> tuple[int, int, int] | None:
+    """``#RRGGBB`` -> 0-255 triple, or ``None`` if it is not one.
+
+    ``@color`` maps to the PDF ``/C`` entry, which on a FreeText annot is the
+    background fill. Returning ``None`` rather than raising on an unrecognised
+    value is deliberate: a reviewer recolouring an annotation in Acrobat should
+    change how it looks, never stop the submission artifact from being produced.
+    Grey note colours are excluded so a note keeps its unfilled appearance.
+    """
+    if not value or value in _NOTE_COLORS:
+        return None
+    text = value.strip().lstrip("#")
+    if len(text) != 6:
+        return None
+    try:
+        return (int(text[0:2], 16), int(text[2:4], 16), int(text[4:6], 16))
+    except ValueError:
+        return None
 
 
 def _text_of(el: ET.Element, name: str) -> str:
@@ -119,6 +154,7 @@ def parse_xfdf(xfdf_path: str | Path) -> list[XfdfAnnotation]:
                     text=_text_of(el, "contents"),
                     kind=el.get("subject", "variable"),
                     muted=(el.get("color", "") in _NOTE_COLORS),
+                    fill=_parse_hex(el.get("color")),
                     meta=meta,
                 )
             )
@@ -171,8 +207,8 @@ def render_annotations(
                 doc[a.page_index],
                 a.bbox,
                 a.text,
-                boxed=(a.kind == "domain"),
-                muted=a.muted,
+                fill=a.fill,
+                dashed=(a.kind == "note"),
             )
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -187,7 +223,7 @@ def xfdf_to_pdf(
     xfdf_path: str | Path,
     out_path: str | Path,
 ) -> Path:
-    """Blank CRF + reviewed XFDF -> annotated submission PDF."""
+    """Blank CRF + reviewed XFDF -> annotated PDF."""
     annotations = parse_xfdf(xfdf_path)
     if not annotations:
         raise ValueError(f"{xfdf_path} contains no annotations")

@@ -16,7 +16,7 @@ import io
 
 import pytest
 
-from pipeline.extract import extract_fields
+from pipeline.rows import extract_rows
 from pipeline.models import ReviewStatus
 from pipeline.parse_response import (
     IncompleteResponseError,
@@ -30,35 +30,38 @@ from pipeline.parse_response import (
 from pipeline.prompt import SHEET_COLUMNS
 
 CLEAN_HEADER = ",".join(SHEET_COLUMNS)
+#: The row_id of the "Site Identifier" row on page 1 of the synthetic CRF.
+SITE_ROW = "p1_r004"
 CLEAN = (
     f"{CLEAN_HEADER}\n"
-    "DM_SITEID,1,Site ID,section: DEMOGRAPHICS,DM_SITEID,variable,DM,SITEID,,,"
+    f"{SITE_ROW},1,Demographics,Site Identifier,,variable,DM,SITEID,,,,"
     "Collected,0.9,Site identifier in the page header.\n"
 )
 
 
 @pytest.fixture(scope="module")
-def fieldset(crfs):
-    return extract_fields(crfs["acroform"])
+def rowset(crfs):
+    return extract_rows(crfs["acroform"])
 
 
-def _full_batch_reply(fieldset, page_indexes=(0,)) -> str:
-    """A syntactically valid CSV reply covering every field in a batch."""
-    fields = [f for f in fieldset.fields if f.page_index in set(page_indexes)]
+def _full_batch_reply(rowset, page_indexes=(0,), variable2: str = "") -> str:
+    """A syntactically valid CSV reply covering every row in a batch."""
+    rows = [r for r in rowset.rows if r.page_index in set(page_indexes)]
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=SHEET_COLUMNS, lineterminator="\n")
     writer.writeheader()
-    for f in fields:
+    for row in rows:
         writer.writerow(
             {
-                "field_id": f.field_id,
-                "page": f.page_index + 1,
-                "label": f.label,
-                "context": f.context,
-                "acroform_name": f.acroform_name or "",
+                "row_id": row.row_id,
+                "page": row.display_page,
+                "form": row.form,
+                "text_1": row.text_1,
+                "text_2": row.text_2,
                 "kind": "variable",
                 "domain": "DM",
                 "variable": "SITEID",
+                "variable2": variable2,
                 "condition": "",
                 "codelist": "",
                 "origin": "Collected",
@@ -94,12 +97,12 @@ def test_parses_a_markdown_table_reformatting():
 
 def test_strips_a_code_fence_around_csv():
     fenced = f"```csv\n{CLEAN}\n```"
-    assert parse_proposals(fenced)[0].field_id == "DM_SITEID"
+    assert parse_proposals(fenced)[0].row_id == SITE_ROW
 
 
 def test_strips_a_code_fence_around_a_markdown_table():
     fenced = f"```\n{_as_markdown_table(CLEAN)}\n```"
-    assert parse_proposals(fenced)[0].field_id == "DM_SITEID"
+    assert parse_proposals(fenced)[0].row_id == SITE_ROW
 
 
 def test_ignores_conversational_wrapping():
@@ -120,7 +123,7 @@ def test_normalizes_smart_quotes_in_a_quoted_csv_field():
         '"Site identifier, in the page header."',
     )
     smart = quoted.replace('"', "“", 1).replace('"', "”", 1)
-    assert parse_proposals(smart)[0].field_id == "DM_SITEID"
+    assert parse_proposals(smart)[0].row_id == SITE_ROW
 
 
 def test_treats_the_models_stand_ins_for_empty_as_null():
@@ -131,12 +134,12 @@ def test_treats_the_models_stand_ins_for_empty_as_null():
 
 def test_ignores_extra_columns_the_model_volunteers():
     text = CLEAN_HEADER + ",sdtm_class\n" + CLEAN.splitlines()[1] + ",Special Purpose\n"
-    assert parse_proposals(text)[0].field_id == "DM_SITEID"
+    assert parse_proposals(text)[0].row_id == SITE_ROW
 
 
 def test_column_headers_are_matched_case_and_space_insensitively_in_markdown():
-    md = _as_markdown_table(CLEAN).replace("field_id", "Field Id")
-    assert parse_proposals(md)[0].field_id == "DM_SITEID"
+    md = _as_markdown_table(CLEAN).replace("row_id", "Row Id")
+    assert parse_proposals(md)[0].row_id == SITE_ROW
 
 
 def test_accepts_lowercase_origin_spellings():
@@ -149,7 +152,7 @@ def test_tab_separated_reply_still_parses():
     if a chat UI's whitespace handling ends up producing tabs instead of
     commas, the sniffer should still recover it."""
     tsv = CLEAN.replace(",", "\t")
-    assert parse_proposals(tsv)[0].field_id == "DM_SITEID"
+    assert parse_proposals(tsv)[0].row_id == SITE_ROW
 
 
 # --- failing loudly ----------------------------------------------------------
@@ -165,9 +168,9 @@ def test_prose_only_response_raises():
         parse_proposals("I'm sorry, I can't help with that request.")
 
 
-def test_a_row_missing_field_id_is_rejected_not_silently_dropped():
-    text = CLEAN_HEADER + "\n" + CLEAN.splitlines()[1].replace("DM_SITEID", "", 1)
-    with pytest.raises(ResponseParseError, match="field_id"):
+def test_a_row_missing_row_id_is_rejected_not_silently_dropped():
+    text = CLEAN_HEADER + "\n" + CLEAN.splitlines()[1].replace(SITE_ROW, "", 1)
+    with pytest.raises(ResponseParseError, match="row_id"):
         parse_proposals(text)
 
 
@@ -177,19 +180,21 @@ def test_report_truncates_a_huge_paste_but_says_so():
     assert "more chars" in report and len(report) < 400
 
 
-def test_a_short_reply_is_never_silently_accepted(fieldset, tmp_path):
+def test_a_short_reply_is_never_silently_accepted(rowset, tmp_path):
     path = tmp_path / "r.csv"
     path.write_text(CLEAN, encoding="utf-8")
     with pytest.raises(IncompleteResponseError) as exc:
-        ingest_response_file(path, fieldset, [0])
-    assert "DM_USUBJID" in exc.value.missing or len(exc.value.missing) > 0
+        ingest_response_file(path, rowset, [0])
+    # Every page-1 row except the one the reply covered.
+    assert len(exc.value.missing) == len(rowset.for_page(0)) - 1
+    assert SITE_ROW not in exc.value.missing
     assert "Re-paste" in str(exc.value)
 
 
-def test_a_short_reply_can_be_accepted_deliberately(fieldset, tmp_path):
+def test_a_short_reply_can_be_accepted_deliberately(rowset, tmp_path):
     path = tmp_path / "r.csv"
     path.write_text(CLEAN, encoding="utf-8")
-    got = ingest_response_file(path, fieldset, [0], allow_partial=True)
+    got = ingest_response_file(path, rowset, [0], allow_partial=True)
     assert len(got.annotations) == 1
 
 
@@ -206,79 +211,124 @@ def test_a_stray_pipe_inside_a_markdown_cell_fails_loudly_not_silently():
     """
     header = "| " + " | ".join(SHEET_COLUMNS) + " |"
     sep = "|" + "|".join(["---"] * len(SHEET_COLUMNS)) + "|"
-    # One extra '|' inside the context cell -- as if the field's context had
-    # not been sanitised of pipes.
+    # One extra '|' inside the question-text cell, as if a CRF question
+    # legitimately contained a pipe and nothing had escaped it.
+    # Note the pipe has to add a cell the header does not have. "Sex | Male"
+    # would not: text_1 and text_2 are legitimately two columns, so it lands
+    # exactly on the header count and is indistinguishable from a correct row.
+    # That is the point of counting cells rather than hunting for pipes.
     bad_row = (
-        "| DM_SITEID | 1 | Site ID | line: A | B | DM_SITEID | variable | DM | "
-        "SITEID |  |  | Collected | 0.9 | x |"
+        f"| {SITE_ROW} | 1 | Demographics | Sex | or gender | Male | variable | DM | "
+        "SEX |  |  |  | Collected | 0.9 | x |"
     )
     with pytest.raises(ResponseParseError, match="shifted the columns|unescaped"):
         parse_proposals("\n".join([header, sep, bad_row]))
 
 
-def test_a_row_naming_an_unknown_field_id_is_caught():
-    """A row whose field_id does not exist anywhere in the document -- a typo
+def test_a_row_naming_an_unknown_row_id_is_caught():
+    """A row whose row_id does not exist anywhere in the document -- a typo
     or a row from an entirely different CRF."""
-    bogus = CLEAN.replace("DM_SITEID", "NOT_A_REAL_FIELD")
+    bogus = CLEAN.replace(SITE_ROW, "p99_r999")
     proposals = parse_proposals(bogus)
-    from pipeline.models import FieldSet
+    from pipeline.models import RowSet
 
-    empty_fieldset = FieldSet(source_pdf="x.pdf")
+    empty_rowset = RowSet(source_pdf="x.pdf")
     with pytest.raises(ResponseParseError, match="not in this document"):
-        attach_geometry(proposals, empty_fieldset)
+        attach_geometry(proposals, empty_rowset)
 
 
 # --- rejoining geometry and provenance ---------------------------------------
 
 
-def test_geometry_comes_from_the_fieldset_not_the_reply(fieldset):
+def test_geometry_comes_from_the_rowset_not_the_reply(rowset):
     proposals = parse_proposals(CLEAN)
-    annots = attach_geometry(proposals, fieldset)
-    source = fieldset.by_id("DM_SITEID")
-    assert annots[0].bbox == source.bbox
-    assert annots[0].field_id == source.field_id
+    annots = attach_geometry(proposals, rowset)
+    source = rowset.by_id(SITE_ROW)
+    assert source is not None, f"{SITE_ROW} is no longer in the synthetic CRF"
+    assert annots[0].bbox == source.anchor
+    assert annots[0].row_id == source.row_id
     assert annots[0].page_index == source.page_index
 
 
-def test_join_survives_row_reordering(fieldset):
-    """field_id, not row position, is the join key -- this is the whole
+def test_join_survives_row_reordering(rowset):
+    """row_id, not row position, is the join key -- this is the whole
     point of moving off a positional index."""
-    text = _full_batch_reply(fieldset, (0,))
+    text = _full_batch_reply(rowset, (0,))
     rows = text.splitlines()
     header, data = rows[0], rows[1:]
     reordered = "\n".join([header] + list(reversed(data)))
-    annots = attach_geometry(parse_proposals(reordered), fieldset)
-    assert {a.field_id for a in annots} == {f.field_id for f in fieldset.for_page(0)}
+    annots = attach_geometry(parse_proposals(reordered), rowset)
+    assert {a.row_id for a in annots} == {r.row_id for r in rowset.for_page(0)}
 
 
-def test_everything_arrives_as_an_unreviewed_proposal(fieldset):
-    annots = attach_geometry(parse_proposals(_full_batch_reply(fieldset, (0,))), fieldset)
+def test_everything_arrives_as_an_unreviewed_proposal(rowset):
+    annots = attach_geometry(parse_proposals(_full_batch_reply(rowset, (0,))), rowset)
     assert annots
     assert all(a.review_status is ReviewStatus.PROPOSED for a in annots)
     assert all(a.reviewed_by is None for a in annots)
 
 
-def test_provenance_records_the_manual_paste(fieldset):
-    annots = attach_geometry(parse_proposals(CLEAN), fieldset)
+def test_provenance_records_the_manual_paste(rowset):
+    annots = attach_geometry(parse_proposals(CLEAN), rowset)
     assert annots[0].source_model == SOURCE_MODEL
     assert "Copilot" in annots[0].source_model
     assert annots[0].created_at is not None
 
 
-def test_full_batch_reply_round_trips_every_field(fieldset, tmp_path):
+def test_full_batch_reply_round_trips_every_field(rowset, tmp_path):
     path = tmp_path / "r.csv"
-    path.write_text(_full_batch_reply(fieldset, (0,)), encoding="utf-8")
-    got = ingest_response_file(path, fieldset, [0])
-    assert len(got.annotations) == len(fieldset.for_page(0))
-    assert {a.field_id for a in got.annotations} == {
-        f.field_id for f in fieldset.for_page(0)
+    path.write_text(_full_batch_reply(rowset, (0,)), encoding="utf-8")
+    got = ingest_response_file(path, rowset, [0])
+    assert len(got.annotations) == len(rowset.for_page(0))
+    assert {a.row_id for a in got.annotations} == {
+        r.row_id for r in rowset.for_page(0)
     }
 
 
-def test_a_batch_spanning_multiple_pages_round_trips(fieldset, tmp_path):
+def test_a_batch_spanning_multiple_pages_round_trips(rowset, tmp_path):
     """The actual point of the redesign: one reply, many pages."""
     path = tmp_path / "r.csv"
-    path.write_text(_full_batch_reply(fieldset, (0, 1)), encoding="utf-8")
-    got = ingest_response_file(path, fieldset, [0, 1])
-    assert {a.field_id for a in got.annotations} == {f.field_id for f in fieldset.fields}
+    path.write_text(_full_batch_reply(rowset, (0, 1)), encoding="utf-8")
+    got = ingest_response_file(path, rowset, [0, 1])
+    assert {a.row_id for a in got.annotations} == {
+        r.row_id for r in rowset.for_pages([0, 1])
+    }
     assert {a.page_index for a in got.annotations} == {0, 1}
+
+
+def test_variable2_becomes_a_second_annotation_on_the_same_row(rowset):
+    """The AGE / AGEU case: one printed line, two SDTM variables.
+
+    Expanded from a column rather than a second sheet row, so "one row in, one
+    row out" stays true of the reply -- which is what the row_id join relies on.
+    """
+    text = _full_batch_reply(rowset, (0,), variable2="AGEU")
+    proposals = parse_proposals(text)
+    by_slot = {}
+    for p in proposals:
+        by_slot.setdefault(p.row_id, {})[p.slot] = p
+
+    first = next(iter(by_slot.values()))
+    assert set(first) == {1, 2}
+    assert first[1].variable == "SITEID"
+    assert first[2].variable == "AGEU"
+
+    annots = attach_geometry(proposals, rowset)
+    slots = [a for a in annots if a.row_id == next(iter(by_slot))]
+    assert {a.slot for a in slots} == {1, 2}
+    assert len({a.annot_id for a in annots}) == len(annots), "annot_ids collided"
+
+
+def test_a_second_variable_does_not_inherit_the_first_conditions(rowset):
+    """AGEU is not "AGE when something" -- carrying the condition over would
+    attach a where-clause nobody asked for."""
+    header = ",".join(SHEET_COLUMNS)
+    line = (
+        f"{SITE_ROW},1,Demographics,Age (years) at time of consent,,variable,DM,"
+        "AGE,AGEU,VSTESTCD = SYSBP,,Collected,0.9,x"
+    )
+    proposals = parse_proposals(f"{header}\n{line}\n")
+    assert len(proposals) == 2
+    assert proposals[0].condition == "VSTESTCD = SYSBP"
+    assert proposals[1].variable == "AGEU"
+    assert proposals[1].condition is None

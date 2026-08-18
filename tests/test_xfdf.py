@@ -18,6 +18,7 @@ from pipeline.models import (
     ReviewStatus,
     SdtmAnnotation,
 )
+from pipeline.models import NOT_SUBMITTED_TEXT  # noqa: E402
 from pipeline.xfdf import XFDF_NS, build_xfdf, write_xfdf
 from pipeline.xfdf_to_pdf import overflowing_annotations, parse_xfdf, xfdf_to_pdf
 
@@ -27,7 +28,7 @@ BOX = BBox(x0=200.0, y0=650.0, x1=300.0, y1=662.0)
 def _annot(**kw) -> SdtmAnnotation:
     base = dict(
         annot_id="a1",
-        field_id="DM_USUBJID",
+        row_id="DM_USUBJID",
         page_index=0,
         bbox=BOX,
         kind=AnnotationKind.VARIABLE,
@@ -83,7 +84,9 @@ def test_contents_carry_the_rendered_annotation_text():
         _set(_annot(variable="VSORRES", domain="VS", condition="VSTESTCD = SYSBP")),
         "blank.pdf",
     )
-    assert "<contents>VS.VSORRES when VSTESTCD = SYSBP</contents>" in xml
+    # Un-prefixed, per MSG v2.0: the domain is carried by the annotation's colour
+    # and the page-top legend, not repeated inside every box.
+    assert "<contents>VSORRES when VSTESTCD = SYSBP</contents>" in xml
 
 
 def test_unmapped_fields_are_still_written_visibly():
@@ -99,7 +102,7 @@ def test_unmapped_fields_are_still_written_visibly():
         ),
         "blank.pdf",
     )
-    assert "<contents>[Not Submitted]</contents>" in xml
+    assert f"<contents>{NOT_SUBMITTED_TEXT}</contents>" in xml
 
 
 def test_rejected_annotations_are_excluded():
@@ -126,14 +129,20 @@ def test_accepted_annotations_are_kept():
 def test_provenance_survives_in_the_carf_namespace(tmp_path):
     path = write_xfdf(_set(_annot(rationale="because")), tmp_path / "x.xfdf")
     meta = parse_xfdf(path)[0].meta
-    assert meta["field_id"] == "DM_USUBJID"
+    assert meta["row_id"] == "DM_USUBJID"
     assert meta["origin"] == "Collected"
     assert meta["review_status"] == "proposed"
 
 
 def test_source_model_is_recorded_as_the_annotation_author():
-    xml = build_xfdf(_set(_annot()), "blank.pdf")
-    assert 'title="Copilot 365 chat, manual paste"' in xml
+    """Provenance goes in @title, whichever step produced the annotation.
+
+    Not asserted against a particular default: with pre-population from mined
+    precedent alongside the Copilot path, "unknown" is the honest default and the
+    producing step is what fills it in.
+    """
+    xml = build_xfdf(_set(_annot(source_model="mined precedent (n=7)")), "blank.pdf")
+    assert 'title="mined precedent (n=7)"' in xml
 
 
 # --- reader ---------------------------------------------------------------
@@ -144,7 +153,7 @@ def test_reader_round_trips_the_writer(tmp_path):
     back = parse_xfdf(path)
     assert len(back) == 1
     assert back[0].bbox.as_tuple() == pytest.approx(BOX.as_tuple(), abs=1e-3)
-    assert back[0].text == "DM.SUBJID"
+    assert back[0].text == "SUBJID"
     assert back[0].annot_id == "a1"
 
 
@@ -237,5 +246,5 @@ def test_rendering_fails_when_the_xfdf_names_a_page_the_pdf_lacks(crfs, tmp_path
         "<contents>X</contents></freetext></annots></xfdf>",
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="has 2 pages"):
+    with pytest.raises(ValueError, match="has 3 pages"):
         xfdf_to_pdf(crfs["acroform"], path, tmp_path / "out.pdf")

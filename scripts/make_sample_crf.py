@@ -1,50 +1,52 @@
 #!/usr/bin/env python3
 """Generate the synthetic blank CRF used to test the pipeline.
 
-Task order step 2.
+This draws a fake CRF from nothing -- an invented protocol, invented questions,
+no study data of any kind. It exists so ``pipeline/rows.py`` and everything
+downstream can be tested without a real CRF anywhere near the repo. Every page
+is stamped SYNTHETIC so a stray copy identifies itself on sight.
 
-This draws a fake CRF from nothing -- an invented protocol, invented fields,
-no study data of any kind. It exists so extract.py and everything downstream
-can be tested without a real CRF anywhere near the repo. Every page is stamped
-SYNTHETIC so a stray copy identifies itself on sight.
+Two variants, and the point of having two has changed:
 
-Three variants, because extract.py has to cope with all of them:
+  SYNTHETIC_sample_crf_twocol_acroform.pdf   real AcroForm widgets
+  SYNTHETIC_sample_crf_twocol_flat.pdf       the same file, widgets baked in
 
-  SYNTHETIC_sample_crf_acroform.pdf  real AcroForm widgets (the good case)
-  SYNTHETIC_sample_crf_flat.pdf      the same file, widgets baked into page
-                                     content: boxed fields, no AcroForm
-  SYNTHETIC_sample_crf_ruled.pdf     the other flat morphology -- text fields
-                                     drawn as fill-in-the-blank underlines
-                                     rather than boxes
+Under the old field-detection design these exercised two different detection
+paths. Under the two-column row model they exercise a stronger claim: extraction
+reads *text*, so the two variants must produce **identical rows**. Widgets and
+their baked outlines contribute no text, and the assertion is that they are
+ignored -- not coped with. The flat variant is produced by ``bake()``-ing the
+AcroForm one, so any difference can only come from the widgets themselves.
 
-The flat variant is produced by ``bake()``-ing the AcroForm one rather than
-being drawn separately, so the two are geometrically identical by construction
-and "do both extraction paths agree?" becomes a real assertion. Two things
-this depends on, both verified rather than assumed:
-
-* A widget with no border bakes to *nothing*. Widgets must carry
-  ``border_width=1`` or the flat variant is a blank page with labels on it.
-* Baking insets coordinates by half the border width (a widget at x0=150.0
-  bakes to a drawn rect at 150.5), because the stroke is centred on the path.
-  Tests comparing AcroForm to flat need a ~1pt tolerance, not equality.
-
-Layout is deliberately adversarial in specific ways:
-
-* **Vertically asymmetric.** Each page has a field near the very top
-  (y_fitz ~50) and one near the very bottom (y_fitz ~760). A y-flip bug lands
-  a mid-page field roughly where it belongs and looks fine; it puts these two
-  in each other's place, which is unmissable.
-* **Non-square bboxes** throughout, so an x/y transposition shows up.
-* **False-positive distractors.** Section rules and the footer rule are long
-  thin horizontal lines that are *not* fields. Without them a naive "every
-  horizontal line is a fill-in blank" detector passes and proves nothing.
-* **Both label geometries.** Demographics labels sit to the left of their
-  field; the Vital Signs grid puts them in a column header above. Those are
-  two different association heuristics.
-* **Non-mapped text** (page numbers, form version) for the ``NotSubmitted``
-  origin case.
-* **A --TESTCD grid** (SYSBP/DIABP/PULSE/TEMP/RESP), which is what exercises
-  the ``VSORRES when VSTESTCD = SYSBP`` condition pattern.
+Layout is deliberately adversarial in specific ways
+---------------------------------------------------
+* **Two-column morphology throughout**, which is the assumption under test:
+  question text in the left column at ``COL1_X``, response text right-aligned
+  to ``COL2_RIGHT``, response widgets to the right of that again.
+* **Both option geometries.** Ethnicity puts its options in the *right* column
+  ("Hispanic or Latino" right-aligned, radio beside it). Race puts them in the
+  *left* column with only a checkbox on the right. Those assemble into rows
+  differently and both are real.
+* **A wrapped question** printed on two lines at the same indent, which must
+  merge into one row -- annotating half a sentence is worse than useless.
+* **Option-only continuation rows** ("No", "Female", "Not Reported",
+  "Unknown") with an empty left column.
+* **A full-width note crossing the gutter**, which must not erase the corridor
+  it crosses and must still survive as a row -- a spanning note is frequently
+  the thing that needs annotating.
+* **Vertically asymmetric.** Real content sits near the very top (y_fitz ~60)
+  and near the very bottom (y_fitz ~757). A y-flip bug lands a mid-page row
+  roughly where it belongs and looks plausible; it puts these two in each
+  other's place, which is unmissable.
+* **A single-column page 3.** ``gutter_x`` must come back ``None`` there, and
+  the document-median fallback must decline to shear it in half. Its page
+  number is right-aligned on purpose, so passing requires
+  ``rows.splits_into_columns`` actually working rather than the trivial
+  no-text-on-the-right case.
+* **A --TESTCD grid** on page 2 (SYSBP/DIABP/PULSE/TEMP/RESP), which is what
+  exercises the ``VSORRES when VSTESTCD = SYSBP`` condition pattern.
+* **Non-mapped page furniture** (page numbers, form version) for the
+  ``NotSubmitted`` origin case.
 
 Deliberately *not* included yet: a rotated page. Realistic, and brutal on
 coordinate handling, but debugging rotation and the y-flip simultaneously is a
@@ -52,17 +54,24 @@ bad trade. Add it once the unrotated path is proven.
 
 The truth file
 --------------
-``sample_crf_truth.json`` is a serialised ``FieldSet`` holding the exact bbox
-and label of every field drawn, in PDF user space. The script knows all of it
-at draw time, so discarding it would force the step-3 test to re-derive
-expected coordinates by hand.
+``sample_crf_rows_truth.json`` commits the generator's **inputs**, not the
+extractor's outputs: for every row, the text of each column, the form it
+belongs to, whether it spans the gutter, and the exact x the text was inserted
+at plus its baseline y. Per page it also commits the bounds the detected gutter
+must fall between, measured from real font metrics at draw time.
 
-It is the only artifact here that gets committed. The PDFs never do -- they
+It deliberately does *not* commit extracted bboxes. A glyph's vertical extent
+comes from PyMuPDF's font metrics rather than from anything this script
+chooses, so committing it would pin a library internal instead of a fact about
+the layout. Committing the insertion anchors and asserting extraction recovers
+them tests the same thing without that coupling.
+
+This is the only artifact here that gets committed. The PDFs never do -- they
 are regenerated on demand. Committing the numbers breaks the circularity that
-would otherwise make the step-3 test worthless: if this generator and
-extract.py were both written against the same wrong assumption, they would
-agree with each other and the test would pass. A committed truth file fails
-loudly the moment the generated layout drifts from it.
+would otherwise make the extraction tests worthless: if this generator and
+``rows.py`` were both written against the same wrong assumption, they would
+agree with each other and the tests would pass while proving nothing. A
+committed truth file fails loudly the moment the generated layout drifts.
 
 Usage:
     python scripts/make_sample_crf.py [--out-dir fixtures]
@@ -71,32 +80,42 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from dataclasses import dataclass, field as dc_field
-from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pymupdf  # noqa: E402
 
-from pipeline.geometry import fitz_rect_to_bbox  # noqa: E402
-from pipeline.models import CRFField, FieldSet, FieldSource, PageGeometry  # noqa: E402
-
 PAGE_W, PAGE_H = 612.0, 792.0
 BANNER = "SYNTHETIC TEST DATA - NOT A REAL CRF"
-PROTOCOL = "Protocol SYNTH-001   Study: Synthetic Demonstration   Subject: ________"
+PROTOCOL = "Protocol SYNTH-001   Subject: ________"
 
 FONT, FONT_BOLD = "helv", "hebo"
 INK = (0.0, 0.0, 0.0)
 GRAY = (0.45, 0.45, 0.45)
 WARN = (0.70, 0.15, 0.15)
 
-# Fixed so the committed truth file is byte-stable across regenerations.
-# This is a generation marker, not a real extraction time.
-TRUTH_TIMESTAMP = datetime(2026, 1, 1, tzinfo=timezone.utc)
+BODY_SIZE = 9.0
+SMALL_SIZE = 7.5
+HEADING_SIZE = 11.5
+
+# Column geometry -- the assumption made concrete.
+COL1_X = 90.0  # question column, left-aligned
+COL2_RIGHT = 470.0  # response column, right-aligned to this edge
+CHECK_X0, CHECK_SIDE = 478.0, 10.0  # radio/checkbox, right of the response text
+BLANK_X0, BLANK_X1 = 398.0, 470.0  # fill-in underline, inside column 2
+TEXTBOX_H = 12.0
 
 RectT = tuple[float, float, float, float]
+
+
+def _width(text: str, size: float, bold: bool = False) -> float:
+    """Advance width of ``text``, from the same font metrics PyMuPDF will draw."""
+    return pymupdf.get_text_length(text, fontname=FONT_BOLD if bold else FONT, fontsize=size)
 
 
 # --------------------------------------------------------------------------
@@ -105,112 +124,168 @@ RectT = tuple[float, float, float, float]
 
 
 @dataclass(frozen=True)
-class Field:
-    name: str  # AcroForm field name, also used as field_id
-    kind: str  # "text" | "checkbox"
-    rect: RectT  # fitz coords: top-left origin, y down
-    label: str
-    context: str
+class Line:
+    """One printed line, described in two-column terms.
 
+    ``col1`` is inserted at ``COL1_X`` (or ``indent`` when given); ``col2`` is
+    right-aligned so its last glyph lands on ``COL2_RIGHT``, which is what makes
+    the response column a column rather than a coincidence.
+    """
 
-@dataclass(frozen=True)
-class Label:
-    xy: tuple[float, float]  # text baseline origin, fitz coords
-    text: str
-    size: float = 9.0
+    y: float  # text baseline, fitz coords (y down)
+    col1: str = ""
+    col2: str = ""
+    size: float = BODY_SIZE
     bold: bool = False
     color: tuple[float, float, float] = INK
+    indent: Optional[float] = None
+    #: A checkbox/radio to the right of the response column.
+    check: bool = False
+    #: A fill-in underline inside the response column.
+    blank: bool = False
+    #: An AcroForm text box instead of an underline, same rect.
+    widget_name: Optional[str] = None
+    #: Expected to fold into the line above it as one wrapped question.
+    merges_up: bool = False
+    #: Expected to be flagged ``full_width`` -- crosses the gutter.
+    spans: bool = False
+
+    @property
+    def x1_start(self) -> float:
+        return self.indent if self.indent is not None else COL1_X
+
+    @property
+    def col1_x1(self) -> float:
+        return self.x1_start + _width(self.col1, self.size, self.bold) if self.col1 else 0.0
+
+    @property
+    def x2_start(self) -> float:
+        return COL2_RIGHT - _width(self.col2, self.size, self.bold)
+
+    def widget_rect(self) -> Optional[tuple[RectT, str]]:
+        """Rect and kind of the response control on this line, if any."""
+        if self.check:
+            top = self.y - CHECK_SIDE + 1.0
+            return ((CHECK_X0, top, CHECK_X0 + CHECK_SIDE, top + CHECK_SIDE), "checkbox")
+        if self.blank or self.widget_name:
+            return ((BLANK_X0, self.y - TEXTBOX_H + 2.0, BLANK_X1, self.y + 2.0), "text")
+        return None
 
 
 @dataclass(frozen=True)
 class Rule:
-    """A drawn horizontal line that is NOT a field -- a detector distractor."""
+    """A drawn horizontal line that is not a field.
+
+    Kept from the old fixture even though nothing detects lines any more: a
+    section rule is exactly the kind of page furniture that used to be
+    misread as a fill-in blank, and its continued presence is the standing
+    check that nothing has quietly started looking at drawn geometry again.
+    """
 
     y: float
-    x0: float = 72.0
+    x0: float = COL1_X
     x1: float = 540.0
 
 
-@dataclass(frozen=True)
+@dataclass
 class PageSpec:
     index: int
-    labels: list[Label] = dc_field(default_factory=list)
+    form: str
+    lines: list[Line] = dc_field(default_factory=list)
     rules: list[Rule] = dc_field(default_factory=list)
-    fields: list[Field] = dc_field(default_factory=list)
+    #: True when this page is expected to yield ``gutter_x is None``.
+    single_column: bool = False
 
 
-def _chrome(page_no: int, form: str) -> tuple[list[Label], list[Rule]]:
-    """Banner, protocol line, footer -- present on every page."""
-    return (
-        [
-            Label((72, 26), BANNER, size=8, bold=True, color=WARN),
-            Label((72, 44), PROTOCOL, size=8, color=GRAY),
-            # Non-mapped text: these should come back as NotSubmitted.
-            Label((72, 775), f"Form {form} v1.0", size=8, color=GRAY),
-            Label((500, 775), f"Page {page_no} of 2", size=8, color=GRAY),
-        ],
-        [Rule(730.0)],  # footer rule -- distractor
-    )
+def _chrome(page_no: int, n_pages: int, form: str) -> list[Line]:
+    """Banner, protocol line and footer -- present on every page.
+
+    The footer is a genuine two-column line: form version at the left, page
+    number right-aligned into the response column. That keeps page furniture
+    from being a special case, and on the single-column page it is what makes
+    the ``splits_into_columns`` guard load-bearing.
+    """
+    return [
+        Line(y=30.0, col1=BANNER, size=8.0, bold=True, color=WARN),
+        Line(y=44.0, col1=PROTOCOL, size=8.0, color=GRAY),
+        Line(y=58.0, col1=f"Form: {form}", size=8.0, bold=True),
+        Line(
+            y=770.0,
+            col1=f"Form {form} v1.0",
+            col2=f"Page {page_no} of {n_pages}",
+            size=8.0,
+            color=GRAY,
+        ),
+    ]
 
 
 def demographics_page() -> PageSpec:
-    labels, rules = _chrome(1, "DM")
-    labels += [
-        Label((72, 92), "DEMOGRAPHICS", size=14, bold=True),
-        Label((420, 62), "Site ID:"),
-        Label((72, 134), "Subject Identifier:"),
-        Label((72, 164), "Date of Birth (DD/MMM/YYYY):"),
-        Label((72, 194), "Age at Consent:"),
-        Label((262, 194), "years", color=GRAY),
-        Label((72, 224), "Sex:"),
-        Label((218, 222), "Male"),
-        Label((296, 222), "Female"),
-        Label((72, 254), "Race:"),
-        Label((218, 252), "White"),
-        Label((218, 272), "Black or African American"),
-        Label((218, 292), "Asian"),
-        Label((218, 312), "American Indian or Alaska Native"),
-        Label((72, 344), "Ethnicity:"),
-        Label((218, 342), "Hispanic or Latino"),
-        Label((218, 362), "Not Hispanic or Latino"),
-        Label((72, 394), "Country of Enrollment:"),
-        Label((72, 757), "Investigator Initials:"),
-    ]
-    rules += [Rule(100.0)]  # section rule -- distractor
-
-    ctx = "Demographics"
-    fields = [
+    lines = _chrome(1, 3, "Demographics")
+    lines += [
         # Top outlier -- pairs with the bottom outlier to expose a y-flip.
-        Field("DM_SITEID", "text", (470, 50, 570, 66), "Site ID", f"{ctx}; page header"),
-        Field("DM_USUBJID", "text", (200, 122, 400, 138), "Subject Identifier", ctx),
-        # Three adjacent blanks sharing one label.
-        Field("DM_BRTHDTC_DD", "text", (200, 152, 235, 168),
-              "Date of Birth (DD/MMM/YYYY)", f"{ctx}; day component"),
-        Field("DM_BRTHDTC_MMM", "text", (245, 152, 290, 168),
-              "Date of Birth (DD/MMM/YYYY)", f"{ctx}; month component"),
-        Field("DM_BRTHDTC_YYYY", "text", (300, 152, 355, 168),
-              "Date of Birth (DD/MMM/YYYY)", f"{ctx}; year component"),
-        Field("DM_AGE", "text", (200, 182, 250, 198), "Age at Consent",
-              f"{ctx}; units printed as 'years'"),
-        Field("DM_SEX_M", "checkbox", (200, 212, 212, 224), "Male", f"{ctx}; Sex"),
-        Field("DM_SEX_F", "checkbox", (278, 212, 290, 224), "Female", f"{ctx}; Sex"),
-        Field("DM_RACE_WHITE", "checkbox", (200, 242, 212, 254), "White", f"{ctx}; Race"),
-        Field("DM_RACE_BLACK", "checkbox", (200, 262, 212, 274),
-              "Black or African American", f"{ctx}; Race"),
-        Field("DM_RACE_ASIAN", "checkbox", (200, 282, 212, 294), "Asian", f"{ctx}; Race"),
-        Field("DM_RACE_AIAN", "checkbox", (200, 302, 212, 314),
-              "American Indian or Alaska Native", f"{ctx}; Race"),
-        Field("DM_ETHNIC_HL", "checkbox", (200, 332, 212, 344),
-              "Hispanic or Latino", f"{ctx}; Ethnicity"),
-        Field("DM_ETHNIC_NHL", "checkbox", (200, 352, 212, 364),
-              "Not Hispanic or Latino", f"{ctx}; Ethnicity"),
-        Field("DM_COUNTRY", "text", (200, 382, 360, 398),
-              "Country of Enrollment", ctx),
+        Line(y=80.0, col1="Site Identifier", blank=True, widget_name="DM_SITEID"),
+        Line(y=104.0, col1="Was this participant a prior screen failure?", col2="Yes", check=True),
+        Line(y=118.0, col2="No", check=True),
+        # A wrapped question: two lines, same indent, tight leading -> one row.
+        Line(y=142.0, col1="If Yes, please provide the original", indent=95.0),
+        Line(
+            y=152.0,
+            col1="participant number (xxxxx-xxxx)",
+            indent=95.0,
+            merges_up=True,
+            blank=True,
+            widget_name="DM_PSUBJID",
+        ),
+        Line(y=182.0, col1="DEMOGRAPHICS", size=HEADING_SIZE, bold=True),
+        Line(y=206.0, col1="Year of Birth (yyyy)", blank=True, widget_name="DM_BRTHDTC"),
+        Line(
+            y=230.0,
+            col1="Age (years) at time of consent",
+            col2="Fixed Unit: years",
+            blank=True,
+            widget_name="DM_AGE",
+        ),
+        Line(y=254.0, col1="Sex", col2="Male", check=True),
+        Line(y=268.0, col2="Female", check=True),
+        Line(
+            y=292.0,
+            col1="Is the participant of childbearing potential?",
+            col2="Yes",
+            check=True,
+        ),
+        Line(y=306.0, col2="No", check=True),
+        # Options in the RIGHT column, right-aligned.
+        Line(y=330.0, col1="Ethnicity", col2="Hispanic or Latino", check=True),
+        Line(y=344.0, col2="Not Hispanic or Latino", check=True),
+        Line(y=358.0, col2="Not Reported", check=True),
+        Line(y=372.0, col2="Unknown", check=True),
+        Line(y=400.0, col1="Race (check all that apply)"),
+        # Full-width note crossing the gutter: must not erase the corridor,
+        # must still come back as a row.
+        Line(
+            y=414.0,
+            col1=(
+                "When multiple values are selected then RACE = MULTIPLE and individual "
+                "responses are RACE1, RACE2, RACEn in SUPPDM"
+            ),
+            size=SMALL_SIZE,
+            spans=True,
+        ),
+        # Options in the LEFT column, checkbox only on the right.
+        Line(y=436.0, col1="American Indian or Alaska Native", indent=95.0, check=True),
+        Line(y=450.0, col1="Asian", indent=95.0, check=True),
+        Line(y=464.0, col1="Black or African American", indent=95.0, check=True),
+        Line(y=478.0, col1="White", indent=95.0, check=True),
+        Line(y=506.0, col1="Country of Enrollment", blank=True, widget_name="DM_COUNTRY"),
         # Bottom outlier.
-        Field("DM_INVINIT", "text", (200, 745, 300, 761), "Investigator Initials",
-              f"{ctx}; page footer"),
+        Line(y=757.0, col1="Investigator Initials", blank=True, widget_name="DM_INVINIT"),
     ]
-    return PageSpec(index=0, labels=labels, rules=rules, fields=fields)
+    return PageSpec(
+        index=0,
+        form="Demographics",
+        lines=lines,
+        rules=[Rule(190.0), Rule(740.0)],
+    )
 
 
 VS_ROWS = [
@@ -223,62 +298,68 @@ VS_ROWS = [
 
 
 def vital_signs_page() -> PageSpec:
-    labels, rules = _chrome(2, "VS")
-    labels += [
-        Label((72, 92), "VITAL SIGNS", size=14, bold=True),
-        Label((398, 62), "Visit Date:"),
-        # Column headers: label ABOVE the field, unlike page 1.
-        Label((72, 140), "Assessment", bold=True),
-        Label((250, 140), "Result", bold=True),
-        Label((360, 140), "Unit", bold=True),
-        Label((440, 140), "Not Done", bold=True),
-        Label((72, 340), "Position:"),
-        Label((218, 338), "Sitting"),
-        Label((298, 338), "Supine"),
-        Label((378, 338), "Standing"),
-        Label((72, 757), "Assessor Initials:"),
+    lines = _chrome(2, 3, "Vital Signs")
+    lines += [
+        Line(y=80.0, col1="Visit Date", blank=True, widget_name="VS_VISITDAT"),
+        Line(y=110.0, col1="VITAL SIGNS", size=HEADING_SIZE, bold=True),
     ]
-    rules += [Rule(100.0), Rule(146.0)]  # section + header rules -- distractors
-
-    ctx = "Vital Signs"
-    fields = [
-        # Top outlier.
-        Field("VS_VISITDAT", "text", (470, 50, 570, 66),
-              "Visit Date", f"{ctx}; page header"),
-    ]
-
     for i, (testcd, test_label, unit) in enumerate(VS_ROWS):
-        y0 = 155.0 + i * 30.0
-        y1 = y0 + 16.0
-        labels.append(Label((72, y0 + 12), test_label))
-        labels.append(Label((360, y0 + 12), unit, color=GRAY))
-        row_ctx = f"{ctx}; row '{test_label}' ({unit}); grid column 'Result'"
-        fields.append(
-            Field(f"VS_{testcd}_RES", "text", (250, y0, 340, y1), test_label, row_ctx)
-        )
-        fields.append(
-            Field(
-                f"VS_{testcd}_ND",
-                "checkbox",
-                (440, y0 + 2, 452, y0 + 14),
-                "Not Done",
-                f"{ctx}; row '{test_label}'; grid column 'Not Done'",
+        lines.append(
+            Line(
+                y=140.0 + i * 24.0,
+                col1=test_label,
+                col2=unit,
+                blank=True,
+                widget_name=f"VS_{testcd}_RES",
             )
         )
-
-    fields += [
-        Field("VS_POS_SIT", "checkbox", (200, 328, 212, 340), "Sitting", f"{ctx}; Position"),
-        Field("VS_POS_SUP", "checkbox", (280, 328, 292, 340), "Supine", f"{ctx}; Position"),
-        Field("VS_POS_STA", "checkbox", (360, 328, 372, 340), "Standing", f"{ctx}; Position"),
-        # Bottom outlier.
-        Field("VS_ASSINIT", "text", (200, 745, 300, 761), "Assessor Initials",
-              f"{ctx}; page footer"),
+    lines += [
+        Line(y=290.0, col1="Position", col2="Sitting", check=True),
+        Line(y=304.0, col2="Supine", check=True),
+        Line(y=318.0, col2="Standing", check=True),
+        Line(y=757.0, col1="Assessor Initials", blank=True, widget_name="VS_ASSINIT"),
     ]
-    return PageSpec(index=1, labels=labels, rules=rules, fields=fields)
+    return PageSpec(
+        index=1, form="Vital Signs", lines=lines, rules=[Rule(120.0), Rule(740.0)]
+    )
+
+
+INSTRUCTION_PARAGRAPHS = [
+    "Complete every page of this form in indelible black ink. Do not use correction fluid of",
+    "any kind. If an entry requires correction, strike through the original value with a single",
+    "line, enter the corrected value alongside it, and initial and date the change so that the",
+    "original entry remains legible for the duration of the retention period.",
+    "Where a measurement was not obtained, record the reason in the comment field rather",
+    "than leaving the entry blank. A blank entry cannot be distinguished from an omission",
+    "during data review and will be raised as a query against the site.",
+]
+
+
+def instructions_page() -> PageSpec:
+    """A genuinely single-column page -- ``gutter_x`` must come back ``None``.
+
+    Every paragraph line is drawn wide enough to exceed
+    ``rows.FULL_WIDTH_FRACTION`` of the page, so gutter detection sets them
+    aside, and the only remaining text on the right-hand side is the footer's
+    page number. One run there is below ``rows.MIN_COLUMN_RUNS``, which is the
+    guard this page exists to exercise: it must decline both its own detection
+    and the borrowed document median.
+    """
+    lines = _chrome(3, 3, "Instructions")
+    lines.append(Line(y=90.0, col1="INSTRUCTIONS FOR COMPLETION", size=HEADING_SIZE, bold=True))
+    for i, para in enumerate(INSTRUCTION_PARAGRAPHS):
+        lines.append(Line(y=120.0 + i * 16.0, col1=para, size=BODY_SIZE, spans=True))
+    return PageSpec(
+        index=2,
+        form="Instructions",
+        lines=lines,
+        rules=[Rule(100.0), Rule(740.0)],
+        single_column=True,
+    )
 
 
 def layout() -> list[PageSpec]:
-    return [demographics_page(), vital_signs_page()]
+    return [demographics_page(), vital_signs_page(), instructions_page()]
 
 
 # --------------------------------------------------------------------------
@@ -286,8 +367,7 @@ def layout() -> list[PageSpec]:
 # --------------------------------------------------------------------------
 
 
-def _draw_static(page: "pymupdf.Page", spec: PageSpec) -> None:
-    """Labels and rules -- identical across all three variants."""
+def _draw_text(page: "pymupdf.Page", spec: PageSpec) -> None:
     for rule in spec.rules:
         page.draw_line(
             pymupdf.Point(rule.x0, rule.y),
@@ -295,25 +375,40 @@ def _draw_static(page: "pymupdf.Page", spec: PageSpec) -> None:
             color=GRAY,
             width=0.75,
         )
-    for lab in spec.labels:
-        page.insert_text(
-            pymupdf.Point(*lab.xy),
-            lab.text,
-            fontname=FONT_BOLD if lab.bold else FONT,
-            fontsize=lab.size,
-            color=lab.color,
-        )
+    for line in spec.lines:
+        font = FONT_BOLD if line.bold else FONT
+        if line.col1:
+            page.insert_text(
+                pymupdf.Point(line.x1_start, line.y),
+                line.col1,
+                fontname=font,
+                fontsize=line.size,
+                color=line.color,
+            )
+        if line.col2:
+            page.insert_text(
+                pymupdf.Point(line.x2_start, line.y),
+                line.col2,
+                fontname=font,
+                fontsize=line.size,
+                color=line.color,
+            )
 
 
-def _add_widget(page: "pymupdf.Page", f: Field) -> None:
+def _add_widget(page: "pymupdf.Page", line: Line, name: str) -> None:
+    control = line.widget_rect()
+    if control is None:
+        return
+    rect, kind = control
     w = pymupdf.Widget()
-    w.field_name = f.name
-    w.rect = pymupdf.Rect(*f.rect)
-    # Required: a border-less widget bakes to nothing, leaving the flat
-    # variant with no detectable geometry at all.
+    w.field_name = name
+    w.rect = pymupdf.Rect(*rect)
+    # Required: a border-less widget bakes to *nothing*, which would leave the
+    # flat variant with no drawn geometry at all and make the two variants
+    # trivially equal for the wrong reason.
     w.border_width = 1
     w.border_color = INK
-    if f.kind == "checkbox":
+    if kind == "checkbox":
         w.field_type = pymupdf.PDF_WIDGET_TYPE_CHECKBOX
         w.field_value = False
     else:
@@ -321,17 +416,6 @@ def _add_widget(page: "pymupdf.Page", f: Field) -> None:
         w.field_value = ""
         w.text_fontsize = 9
     page.add_widget(w)
-
-
-def _draw_ruled_field(page: "pymupdf.Page", f: Field) -> None:
-    """The other flat morphology: fill-in blanks as underlines, not boxes."""
-    x0, y0, x1, y1 = f.rect
-    if f.kind == "checkbox":
-        page.draw_rect(pymupdf.Rect(x0, y0, x1, y1), color=INK, width=0.9)
-    else:
-        page.draw_line(
-            pymupdf.Point(x0, y1), pymupdf.Point(x1, y1), color=INK, width=0.9
-        )
 
 
 def _new_doc() -> "pymupdf.Document":
@@ -353,19 +437,12 @@ def build_acroform_crf() -> "pymupdf.Document":
     doc = _new_doc()
     for spec in layout():
         page = doc.new_page(width=PAGE_W, height=PAGE_H)
-        _draw_static(page, spec)
-        for f in spec.fields:
-            _add_widget(page, f)
-    return doc
-
-
-def build_ruled_crf() -> "pymupdf.Document":
-    doc = _new_doc()
-    for spec in layout():
-        page = doc.new_page(width=PAGE_W, height=PAGE_H)
-        _draw_static(page, spec)
-        for f in spec.fields:
-            _draw_ruled_field(page, f)
+        _draw_text(page, spec)
+        for i, line in enumerate(spec.lines):
+            if line.widget_rect() is None:
+                continue
+            name = line.widget_name or f"p{spec.index + 1}_ctl{i + 1:03d}"
+            _add_widget(page, line, name)
     return doc
 
 
@@ -374,30 +451,113 @@ def build_ruled_crf() -> "pymupdf.Document":
 # --------------------------------------------------------------------------
 
 
-def build_truth(source_pdf: str) -> FieldSet:
-    """Exact geometry of every field drawn, in PDF user space."""
-    specs = layout()
-    return FieldSet(
-        source_pdf=source_pdf,
-        pages=[
-            PageGeometry(page_index=s.index, width=PAGE_W, height=PAGE_H, rotation=0)
-            for s in specs
-        ],
-        fields=[
-            CRFField(
-                field_id=f.name,
-                page_index=s.index,
-                bbox=fitz_rect_to_bbox(f.rect, PAGE_H),
-                label=f.label,
-                source=FieldSource.ACROFORM,
-                context=f.context,
-                acroform_name=f.name,
+def _norm(text: str) -> str:
+    """Collapse whitespace, as extraction does.
+
+    PyMuPDF returns words, not the source string, so runs of spaces in a label
+    never survive round-tripping through a PDF. The truth file has to expect the
+    collapsed form or it asserts something no extractor could satisfy.
+    """
+    return " ".join(text.split())
+
+
+def expected_rows(spec: PageSpec) -> list[dict]:
+    """The rows ``pipeline.rows`` should recover from this page.
+
+    Built by applying the extractor's *rules* to the layout description, never
+    by running the extractor -- that is what makes this a check rather than a
+    tautology. Three rules matter:
+
+    * a ``merges_up`` line folds into the one above it (one wrapped question);
+    * an empty ``col1`` stays an empty left half (an option-only row);
+    * on a **single-column** page there is no gutter, so ``col2`` is not a
+      separate column -- it joins ``col1`` on the same line, and nothing can be
+      ``full_width`` because there is no corridor to cross.
+
+    That last rule is easy to get wrong in the other direction: expecting a
+    two-column split on a page whose ``gutter_x`` is ``None`` would demand the
+    extractor invent a gutter it correctly declined to find.
+    """
+    rows: list[dict] = []
+    for line in sorted(spec.lines, key=lambda ln: ln.y):
+        if line.merges_up and rows and rows[-1]["text_2"] == "":
+            prev = rows[-1]
+            prev["text_1"] = _norm(f"{prev['text_1']} {line.col1}")
+            continue
+        if spec.single_column:
+            joined = _norm(f"{line.col1} {line.col2}")
+            rows.append(
+                {
+                    "text_1": joined,
+                    "text_2": "",
+                    "anchor_x_1": line.x1_start if joined else None,
+                    "anchor_x_2": None,
+                    "baseline_y": line.y,
+                    "full_width": False,
+                }
             )
+            continue
+        rows.append(
+            {
+                "text_1": _norm(line.col1),
+                "text_2": _norm(line.col2),
+                "anchor_x_1": line.x1_start if line.col1 else None,
+                "anchor_x_2": round(line.x2_start, 3) if line.col2 else None,
+                "baseline_y": line.y,
+                "full_width": line.spans,
+            }
+        )
+    for n, row in enumerate(rows, start=1):
+        row["row_id"] = f"p{spec.index + 1}_r{n:03d}"
+        row["page_index"] = spec.index
+        row["form"] = spec.form
+    return rows
+
+
+def gutter_bounds(spec: PageSpec) -> Optional[dict]:
+    """The interval the detected gutter must fall inside, or ``None``.
+
+    Measured from real font metrics at draw time: the right edge of the widest
+    *non-spanning* left-column text, and the left edge of the leftmost
+    right-column text. Any x between them separates the two columns; anything
+    outside does not. Spanning lines are excluded for the same reason
+    ``rows.detect_gutter`` excludes them -- they cross the corridor by design.
+    """
+    if spec.single_column:
+        return None
+    lo = max((ln.col1_x1 for ln in spec.lines if ln.col1 and not ln.spans), default=0.0)
+    hi = min((ln.x2_start for ln in spec.lines if ln.col2), default=PAGE_W)
+    if lo >= hi:
+        raise AssertionError(
+            f"page {spec.index}: column 1 reaches x={lo:.1f} but column 2 starts at "
+            f"x={hi:.1f} -- the generated layout has no gutter to detect, so the "
+            "fixture itself is wrong, not the extractor"
+        )
+    return {"lo": round(lo, 3), "hi": round(hi, 3)}
+
+
+def build_truth(source_pdf: str) -> dict:
+    specs = layout()
+    return {
+        "source_pdf": source_pdf,
+        "note": (
+            "Generator inputs, committed to break circularity -- see "
+            "scripts/make_sample_crf.py. Coordinates are fitz space (top-left "
+            "origin, y down), matching the insert_text call that drew them."
+        ),
+        "page_width": PAGE_W,
+        "page_height": PAGE_H,
+        "pages": [
+            {
+                "page_index": s.index,
+                "form": s.form,
+                "single_column": s.single_column,
+                "gutter_bounds": gutter_bounds(s),
+            }
             for s in specs
-            for f in s.fields
         ],
-        extracted_at=TRUTH_TIMESTAMP,
-    )
+        "rows": [row for s in specs for row in expected_rows(s)],
+    }
 
 
 # --------------------------------------------------------------------------
@@ -409,28 +569,23 @@ def make_sample_crf(out_dir: Path) -> dict[str, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     written: dict[str, Path] = {}
 
-    acro_path = out_dir / "SYNTHETIC_sample_crf_acroform.pdf"
+    acro_path = out_dir / "SYNTHETIC_sample_crf_twocol_acroform.pdf"
     doc = build_acroform_crf()
     doc.save(acro_path, garbage=4, deflate=True)
     written["acroform"] = acro_path
 
-    # Flat = the same document with widgets baked into page content, so the
-    # two variants are geometrically identical by construction.
+    # Flat = the same document with widgets baked into page content. Rows must
+    # be identical across the two, since baking adds drawn outlines but no text.
     doc.bake(widgets=True)
-    flat_path = out_dir / "SYNTHETIC_sample_crf_flat.pdf"
+    flat_path = out_dir / "SYNTHETIC_sample_crf_twocol_flat.pdf"
     doc.save(flat_path, garbage=4, deflate=True)
     written["flat"] = flat_path
     doc.close()
 
-    ruled_path = out_dir / "SYNTHETIC_sample_crf_ruled.pdf"
-    ruled = build_ruled_crf()
-    ruled.save(ruled_path, garbage=4, deflate=True)
-    ruled.close()
-    written["ruled"] = ruled_path
-
-    truth_path = out_dir / "sample_crf_truth.json"
-    truth = build_truth(acro_path.name)
-    truth_path.write_text(truth.model_dump_json(indent=2), encoding="utf-8")
+    truth_path = out_dir / "sample_crf_rows_truth.json"
+    truth_path.write_text(
+        json.dumps(build_truth(acro_path.name), indent=2) + "\n", encoding="utf-8"
+    )
     written["truth"] = truth_path
 
     return written
@@ -447,11 +602,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     written = make_sample_crf(args.out_dir)
-    n_fields = sum(len(s.fields) for s in layout())
+    specs = layout()
+    n_rows = sum(len(expected_rows(s)) for s in specs)
     for kind, path in written.items():
         print(f"{kind:9} {path}")
-    print(f"\n{n_fields} fields across 2 pages")
-    print("PDFs are regenerated, not committed; only sample_crf_truth.json is tracked")
+    print(f"\n{n_rows} rows across {len(specs)} pages")
+    for s in specs:
+        bounds = gutter_bounds(s)
+        where = "single-column" if bounds is None else f"gutter in ({bounds['lo']}, {bounds['hi']})"
+        print(f"  page {s.index + 1}  {s.form:14} {where}")
+    print("\nPDFs are regenerated, not committed; only sample_crf_rows_truth.json is tracked")
     return 0
 
 
