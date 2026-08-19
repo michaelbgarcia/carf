@@ -109,12 +109,27 @@ def clean_label(text: str) -> str:
     return " ".join(text.split()).rstrip(":").strip()
 
 
+def rect_area(rect: pymupdf.Rect) -> float:
+    """Area of a rect, from its coordinates.
+
+    Not ``Rect.get_area()``: this project pins PyMuPDF unversioned, and that
+    method is not on every release (older ones spell it ``getArea``). The
+    arithmetic is one line and depending on the API buys nothing.
+
+    Clamping each extent at zero is the other half of why this exists. An empty
+    intersection comes back as a rect with *reversed* coordinates, so multiplying
+    the raw differences would score two negatives as a positive area -- reporting
+    a solid overlap where the rects do not touch at all.
+    """
+    return max(0.0, rect.x1 - rect.x0) * max(0.0, rect.y1 - rect.y0)
+
+
 def _masked(rect: pymupdf.Rect, exclude: list[pymupdf.Rect]) -> bool:
     """Whether ``rect`` lies far enough inside any excluded rect to be dropped."""
-    area = abs(rect.get_area())
+    area = rect_area(rect)
     if area <= 0:
         return False
-    return any(abs((rect & m).get_area()) / area >= MASK_CONTAINMENT for m in exclude)
+    return any(rect_area(rect & m) / area >= MASK_CONTAINMENT for m in exclude)
 
 
 def text_runs(
@@ -272,6 +287,7 @@ __all__ = [
     "line_bands",
     "line_rect",
     "lines_of",
+    "rect_area",
     "text_runs",
     "v_overlap",
 ]

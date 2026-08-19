@@ -31,7 +31,7 @@ from pipeline.rows import (
     form_name,
     splits_into_columns,
 )
-from pipeline.text import TextRun, line_bands, lines_of, text_runs
+from pipeline.text import TextRun, line_bands, lines_of, rect_area, text_runs
 
 # Points. Extraction recovers the drawn insertion x to floating-point precision
 # (measured worst case across all 54 rows: 0.0000pt), so this is headroom for
@@ -473,3 +473,38 @@ def test_annotation_rects_ignores_markup_that_carries_no_text(crfs, tmp_path):
     assert [r.text_1 for r in extract_rows(out).rows] == [
         r.text_1 for r in extract_rows(crfs["acroform"]).rows
     ]
+
+
+def test_rect_area_scores_a_missed_intersection_as_zero():
+    """Two rects that do not touch overlap by nothing, however they are subtracted.
+
+    PyMuPDF returns an empty intersection as a rect with *reversed* coordinates,
+    so multiplying the raw differences turns two negatives into a positive area
+    -- which would report a solid overlap between rects on opposite sides of the
+    page and mask real question text away.
+    """
+    left = pymupdf.Rect(0, 0, 10, 10)
+    right = pymupdf.Rect(500, 500, 510, 510)
+    assert rect_area(left) == 100.0
+    assert rect_area(left & right) == 0.0
+
+    # And a real partial overlap is still measured.
+    assert rect_area(left & pymupdf.Rect(5, 5, 15, 15)) == 25.0
+
+
+def test_masking_needs_more_than_a_graze(crfs, tmp_path):
+    """A word half inside an annotation goes; a word barely clipped by one stays.
+
+    An annotation that overlaps printed text is a layout defect, but the form's
+    own text is not recoverable once discarded, so the threshold has to be a
+    real fraction rather than "intersects at all".
+    """
+    from pipeline.text import MASK_CONTAINMENT, _masked
+
+    word = pymupdf.Rect(100, 100, 120, 110)  # 20 x 10
+    graze = pymupdf.Rect(118, 100, 140, 110)  # covers 2/20 of it
+    most = pymupdf.Rect(105, 100, 140, 110)  # covers 15/20 of it
+
+    assert MASK_CONTAINMENT == 0.5
+    assert not _masked(word, [graze])
+    assert _masked(word, [most])

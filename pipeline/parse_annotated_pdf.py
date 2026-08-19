@@ -282,18 +282,40 @@ def _mark_colors(
     return stroke, None  # type: ignore[return-value]
 
 
+def _xref_number(entry, default: float) -> float:
+    """A numeric value from ``xref_get_key``, or ``default`` when the key is absent.
+
+    ``xref_get_key`` reports ``("null", "null")`` for a key the annotation does
+    not carry, which is never the same thing as zero: an annotation with no
+    ``/CA`` is fully opaque, not fully transparent.
+    """
+    if not entry or entry[0] not in ("int", "real", "float"):
+        return default
+    try:
+        return float(entry[1])
+    except (TypeError, ValueError):  # pragma: no cover - malformed PDF number
+        return default
+
+
 def _read_style(doc: "pymupdf.Document", annot: "pymupdf.Annot", subtype: str, da) -> MarkStyle:
-    """Every presentation attribute :class:`MarkStyle` records, off one annotation."""
+    """Every presentation attribute :class:`MarkStyle` records, off one annotation.
+
+    Opacity and the annotation flags are read from ``/CA`` and ``/F`` through
+    ``xref_get_key`` rather than through ``Annot.opacity``/``Annot.flags``, which
+    is what the rest of this function already does for ``/DA``, ``/Rotate`` and
+    ``/RC``. Uniform, and it drops two more PyMuPDF properties this project
+    cannot pin a version for.
+    """
     border = annot.border
     width = float(border.get("width") or 0.0)
     dashed = bool(border.get("dashes"))
     font, size = _da_font(da)
     bold, italic = _font_weight(font)
-    flags = int(annot.flags or 0)
+    flags = int(_xref_number(doc.xref_get_key(annot.xref, "F"), 0.0))
     rotate = doc.xref_get_key(annot.xref, "Rotate")
     rich = doc.xref_get_key(annot.xref, "RC")
     info = annot.info
-    opacity = annot.opacity
+    opacity = _xref_number(doc.xref_get_key(annot.xref, "CA"), 1.0)
     return MarkStyle(
         subtype=subtype,
         text_color=_da_text_color(da),
@@ -304,10 +326,8 @@ def _read_style(doc: "pymupdf.Document", annot: "pymupdf.Annot", subtype: str, d
         border_width=width,
         border_style=("dashed" if dashed else "solid") if width > 0 else "none",
         border_color=_mark_colors(annot, subtype)[1],
-        # PyMuPDF returns -1 for "the annot has no /CA entry", which the spec
-        # reads as fully opaque -- not as transparent, and not as unknown.
-        opacity=1.0 if opacity is None or opacity < 0 else float(opacity),
-        rotation=int(rotate[1]) if rotate and rotate[0] == "int" else 0,
+        opacity=opacity,
+        rotation=int(_xref_number(rotate, 0.0)),
         printable=bool(flags & _FLAG_PRINT),
         hidden=bool(flags & (_FLAG_HIDDEN | _FLAG_NOVIEW)),
         rich_text=bool(rich and rich[0] != "null"),
