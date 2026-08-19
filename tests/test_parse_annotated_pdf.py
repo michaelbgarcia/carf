@@ -16,7 +16,7 @@ import pytest
 
 from pipeline import layout, xfdf
 from pipeline.rows import extract_rows
-from pipeline.models import NOT_SUBMITTED_TEXT, AnnotationSet, BBox, PageGeometry
+from pipeline.models import NOT_SUBMITTED_TEXT, AnnotationSet, BBox, PageGeometry, RowSet
 from pipeline.parse_annotated_pdf import (
     POSITION_COLUMNS,
     REPORT_COLUMNS,
@@ -831,3 +831,147 @@ def test_report_rows_carry_exactly_the_declared_columns(crfs, annotated_pdf):
     assert rows
     for row in rows:
         assert list(row) == REPORT_COLUMNS
+
+
+# --- labels are the form's text, never a mark's -------------------------------
+
+
+def _strip_bands(rows: RowSet) -> RowSet:
+    """The same page with no ruled lines -- i.e. the nearest-centroid path alone."""
+    return RowSet(
+        source_pdf=rows.source_pdf,
+        pages=rows.pages,
+        rows=[r.model_copy(update={"band": None}) for r in rows.rows],
+    )
+
+
+def test_labels_are_identical_with_and_without_the_blank_counterpart(crfs, annotated_pdf):
+    """The headline invariant, and the one that was broken.
+
+    ``get_text`` returns a page's annotation text mixed into its printed words,
+    so reading rows off the annotated PDF itself used to produce labels like
+    ``Year of Birth (yyyy) BRTHDTC`` -- the question with its own answer glued
+    on, which then keyed every lookup row derived from it. Matching the
+    blank-counterpart result exactly is the strongest available statement that
+    the annotation layer is no longer being read as form text.
+    """
+    final, _placed = annotated_pdf
+    with_blank = parse_annotated_pdf(final, crfs["acroform"])
+    without_blank = parse_annotated_pdf(final)
+
+    keyed = lambda ms: sorted((m.page_index, m.text, m.label or "") for m in ms)
+    assert keyed(without_blank) == keyed(with_blank)
+    assert any(m.label for m in without_blank)
+
+
+def test_no_recovered_label_contains_the_mark_that_annotates_it(crfs, annotated_pdf):
+    """Stated directly, in case the comparison above ever agrees for a worse reason."""
+    final, _placed = annotated_pdf
+    for m in parse_annotated_pdf(final):
+        if not m.label:
+            continue
+        assert NOT_SUBMITTED_TEXT not in m.label
+        if m.variable:
+            assert m.variable not in m.label.split()
+        assert m.variable is None or not m.label.endswith(m.variable)
+
+
+def test_context_does_not_pick_up_a_mark_in_the_response_column(crfs, annotated_pdf):
+    """``context`` carries the row's response text, which is a label too."""
+    final, _placed = annotated_pdf
+    for m in parse_annotated_pdf(final):
+        assert NOT_SUBMITTED_TEXT not in (m.context or "")
+
+
+def test_extraction_masks_the_annotation_layer_it_was_handed(crfs, annotated_pdf):
+    """The count is the evidence: a "blank" reporting nonzero is not blank."""
+    final, _placed = annotated_pdf
+    assert all(p.masked_annotations == 0 for p in extract_rows(crfs["acroform"]).pages)
+    assert sum(p.masked_annotations for p in extract_rows(final).pages) > 0
+
+
+# --- the ruled line as a matching tier ---------------------------------------
+
+
+def test_a_mark_on_a_rows_ruled_line_beats_a_nearer_neighbouring_row(crfs):
+    """A mark written far right of its question still belongs to that question.
+
+    The shape a human annotator produces and ``layout.place_row`` never does, so
+    no exact alignment can be reconstructed and the old code fell to
+    nearest-centroid -- which picks the option row on the line above. The band
+    settles it by containment.
+    """
+    rows = extract_rows(crfs["acroform"])
+    page_rows = [r for r in rows.rows if r.page_index == 0]
+    target = next(r for r in page_rows if r.text_1.startswith("If Yes, please provide"))
+
+    mark = BBox(
+        x0=target.anchor.x1 + 150,
+        y0=target.band.y0 + 1.0,
+        x1=target.anchor.x1 + 210,
+        y1=target.band.y0 + 11.0,
+    )
+    m = RecoveredMapping(page_index=0, bbox=mark, text="DM.SEX", kind="variable")
+
+    matched = match_marks_to_rows([m], rows)[0]
+    assert (matched.row_id, matched.placement) == (target.row_id, "band")
+
+    # And that this is a change, not a coincidence: without the rules, the same
+    # mark lands on the row above.
+    fallback = match_marks_to_rows([m], _strip_bands(rows))[0]
+    assert fallback.placement == "nearest"
+    assert fallback.row_id != target.row_id
+
+
+def test_a_wrapped_mark_belongs_to_its_own_row_not_the_band_it_sits_in(crfs):
+    """Tier ordering, which is the one thing bands could have broken.
+
+    ``place_row`` drops an over-long annotation a full ``LINE_STEP`` below its
+    row, so it physically sits on the *next* row's rule. Reverse-layout
+    reconstruction has to be consulted first, or every wrapped annotation would
+    be reassigned to the row beneath it.
+    """
+    rows = extract_rows(crfs["acroform"])
+    page_rows = [r for r in rows.rows if r.page_index == 0]
+    row = next(r for r in page_rows if r.text_1 == "Sex")
+    below = min(
+        (r for r in page_rows if r.band.y1 <= row.band.y0),
+        key=lambda r: row.band.y0 - r.band.y1,
+    )
+
+    # Exactly where place_row puts a wrapped annotation: the question's own
+    # indent, one LINE_STEP down.
+    wrapped = BBox(
+        x0=row.anchor.x0,
+        y0=row.anchor.y0 - layout.LINE_STEP,
+        x1=row.anchor.x0 + 60,
+        y1=row.anchor.y0 - layout.LINE_STEP + row.anchor.height,
+    )
+    assert below.band.y0 <= (wrapped.y0 + wrapped.y1) / 2.0 <= below.band.y1  # in the next band
+
+    matched = match_marks_to_rows(
+        [RecoveredMapping(page_index=0, bbox=wrapped, text="SEX", kind="variable")], rows
+    )[0]
+    assert (matched.row_id, matched.placement, matched.wrap_lines) == (row.row_id, "wrap", 1)
+
+
+def test_a_mark_beyond_the_distance_budget_is_still_unmatched(crfs):
+    """Band containment does not become a way around ``max_distance``.
+
+    Out in the left margin: on the "Sex" row's rule, but far from every anchor
+    on the page -- asserted as a precondition, since "far" here has to mean far
+    from *any* row, not just from the one whose band it is in.
+    """
+    from pipeline.parse_annotated_pdf import _proximity
+
+    rows = extract_rows(crfs["acroform"])
+    page_rows = [r for r in rows.rows if r.page_index == 0]
+    row = next(r for r in page_rows if r.text_1 == "Sex")
+
+    stray = BBox(x0=2.0, y0=row.band.y0 + 1, x1=32.0, y1=row.band.y0 + 11)
+    budget = 20.0
+    assert min(_proximity(stray, r.anchor) for r in page_rows) > budget
+    assert row.band.y0 <= (stray.y0 + stray.y1) / 2.0 <= row.band.y1  # still on the rule
+
+    m = RecoveredMapping(page_index=0, bbox=stray, text="SEX", kind="variable")
+    assert match_marks_to_rows([m], rows, max_distance=budget)[0].row_id is None

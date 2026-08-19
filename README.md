@@ -36,6 +36,7 @@ text, up to two bboxes — and not a detected capture field:
 | `form` | Demographics |
 | `text_1` / `bbox_1` | "Age (years) at time of consent" @ 90,558,210,570 |
 | `text_2` / `bbox_2` | "Fixed Unit: years" @ 402,558,470,570 |
+| `band` | the ruled line it sits on @ 0,553,612,577 |
 
 That single assumption dissolves three separate piles of heuristics the earlier
 design needed:
@@ -51,6 +52,15 @@ design needed:
 3. **Placement stops being a collision search.** The gutter is a known empty
    corridor on every row's own baseline, which is where a human annotator
    writes. See [pipeline/layout.py](pipeline/layout.py).
+
+**Rows sit on ruled lines.** A `bbox` is only as tall and as wide as its own
+ink, which leaves the whitespace between two questions belonging to neither —
+and the gutter, where annotations go, belonging to no row at all. So each row
+also carries a `band`: a full-width horizontal strip, like the light blue rule
+on notebook paper. Adjacent bands share an edge, so every point on the page
+belongs to exactly one row, a wrapped question owns both the rules it is written
+across, and "which question is this annotation for" is answered by containment
+rather than by comparing distances to two rows that are both nearby.
 
 It also fails better. A field detector silently omits what it fails to detect,
 so a missed field is invisible. Every printed line becomes a row here, so a row
@@ -291,11 +301,33 @@ The previous design matched against detected widgets, where a dense grid of
 same-sized boxes a few points apart meant nearest-centroid regularly picked the
 neighbouring row.
 
+**Annotation text is not form text, and `get_text` does not know that.** This
+was a real bug, not a hypothetical: on PyMuPDF 1.28.2 a page's annotation text
+comes back mixed into its printed words, so reading rows off a finished aCRF —
+which is what happens whenever no blank counterpart is supplied, i.e. for most
+historical corpora — produced labels like `Year of Birth (yyyy) BRTHDTC`: the
+question with its own answer glued on, used as the key for every lookup row
+derived from it. `extract_rows` now subtracts the annotation layer geometrically
+before grouping anything, filtering on non-empty `/Contents` so that purely
+graphical markup (a group bracket) masks nothing. Labels recovered without a
+blank counterpart now match those recovered with one, exactly. A *flattened*
+aCRF stays unfixable — but degrades safely, since `read_marks` finds nothing on
+one either.
+
 **Two visual conventions**, which conflict on every signal — see
 `classify_mark`. MSG output is bordered and black *everywhere*, so those signals
 carry no information; the older convention (red text for a mapping, grey for a
 note, a border for a banner) has to be checked last or it inverts the
 classification completely.
+
+**A mark on a row's rule belongs to that row.** Between exact reverse-layout
+reconstruction and the nearest-row fallback sits a band-containment tier: a mark
+whose centre is in a row's band is that row's, however far right of the question
+it was written. That is the case a human annotator produces and `place_row`
+never does, and nearest-centroid got it wrong — on the fixture it picks the
+option row on the line above. The tier deliberately ranks *below* exact
+reconstruction, because a wrapped annotation is drawn a full `LINE_STEP` down
+and so physically sits on the next row's rule; tier 1 claims it first.
 
 **A grouped mark comes back as a mapping per covered row.** `place_group` is
 inverted the same way `place_row` is — is this mark centred on a run of

@@ -195,6 +195,12 @@ class PageGeometry(BaseModel):
     stored rather than recomputed so it is inspectable in ``rows.json`` and
     directly assertable in tests, instead of being an invisible intermediate
     that can only be debugged through its downstream effects.
+
+    ``masked_annotations`` counts the text-carrying annotations subtracted from
+    this page before its text was read (see ``rows.extract_rows``). Zero is the
+    expected value for a blank CRF, and a nonzero one on a form that was supposed
+    to be blank is the useful signal: the "blank" copy is not blank, and every
+    label read off it would otherwise have carried a mark's text.
     """
 
     page_index: int = Field(ge=0, description="0-based; add 1 only when showing a human")
@@ -202,6 +208,9 @@ class PageGeometry(BaseModel):
     height: float
     rotation: int = 0
     gutter_x: Optional[float] = None
+    masked_annotations: int = Field(
+        default=0, ge=0, description="Text-carrying annotations subtracted before reading text"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -238,6 +247,19 @@ class CRFRow(BaseModel):
     text_2: str = Field(default="", description="Response column text")
     bbox_1: Optional[BBox] = None
     bbox_2: Optional[BBox] = None
+    #: The full-width horizontal band this row's line sits in -- its ruled line,
+    #: in the notebook-paper sense (see ``text.line_bands``). Unlike ``bbox_1``
+    #: and ``bbox_2``, which are only as tall and as wide as their own ink, the
+    #: band claims the whitespace around the row too: the space between this row
+    #: and its neighbours, and the gutter between the two columns. Consecutive
+    #: bands on a page share an edge, so every point on the page belongs to
+    #: exactly one row's band -- which is what makes "which question is this
+    #: annotation for" answerable by containment rather than by nearest-distance.
+    #: A wrapped question's band is the union of its lines'.
+    #:
+    #: ``None`` for a row not built by ``rows.extract_rows`` -- a hand-built test
+    #: row, or one read back from a ``rows.json`` written before bands existed.
+    band: Optional[BBox] = None
     full_width: bool = Field(
         default=False, description="Run crosses the gutter (header, footer, spanning note)"
     )

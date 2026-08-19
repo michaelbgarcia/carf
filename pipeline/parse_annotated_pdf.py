@@ -595,6 +595,21 @@ def _proximity(mark: BBox, anchor: BBox) -> float:
     return ((cx - nx) ** 2 + (cy - ny) ** 2) ** 0.5
 
 
+def _in_band(mark: BBox, row: CRFRow) -> bool:
+    """Whether the mark's centre sits on this row's own ruled line.
+
+    The centre rather than any edge, because an annotation box is drawn a little
+    taller than the text it contains and routinely pokes into the neighbouring
+    band; where its *middle* is, is where it reads as belonging. Row bands share
+    edges and cover the page (see ``text.line_bands``), so at most one row can
+    answer yes and there is nothing to arbitrate.
+    """
+    if row.band is None:
+        return False
+    _, cy = _center(mark)
+    return row.band.y0 <= cy <= row.band.y1
+
+
 def classify_mark(mark: RawMark) -> str:
     """``"domain"`` | ``"variable"`` | ``"note"`` from a mark's styling.
 
@@ -802,6 +817,15 @@ _ALIGN_TOL = layout.BORDER_INFLATION + 0.05
 _STEP_TOL = 1e-3  # tolerance on (delta / LINE_STEP) being an integer
 #: Keeps any distance fallback ranked behind every exact alignment.
 _CENTROID_OFFSET = layout.MAX_WRAPS + 10.0
+#: Ranks a band containment match between the two: behind every exact
+#: reverse-layout reconstruction (which tops out at ``MAX_WRAPS``, and which
+#: correctly reads a *wrapped* mark as belonging to the row above the band it
+#: physically sits in), and ahead of every nearest-centroid guess.
+_BAND_OFFSET = layout.MAX_WRAPS + 1.0
+#: Divides the proximity added to a band match's rank, purely so two band
+#: candidates order sensibly. Large enough that a band match can never be pushed
+#: as far as ``_CENTROID_OFFSET`` by it, whatever ``max_distance`` is set to.
+_BAND_TIEBREAK = 1000.0
 
 
 def _reverse_layout_score(mark_bbox: BBox, row: CRFRow) -> Optional[tuple[float, str, int]]:
@@ -962,10 +986,22 @@ def match_marks_to_rows(
        of consecutive rows, just past the widest of them? A mark that matches is
        expanded into one mapping *per member row*, so every row of a repeating
        block contributes its own precedent entry.
-    2. **Nearest-row fallback** (:func:`_proximity`) -- for anything with no
-       exact alignment: a third-party aCRF that was never positioned by this
-       codebase, or one a reviewer moved by hand in Acrobat. Ranked behind every
-       tier-1 match via ``_CENTROID_OFFSET``.
+    2. **Same ruled line** (:func:`_in_band`) -- for anything with no exact
+       alignment: a third-party aCRF that was never positioned by this codebase,
+       or one a reviewer moved by hand in Acrobat. A mark whose centre sits in a
+       row's band is that row's, however far right of the question text it was
+       written, because the bands tile the page and the one it is in is the line
+       it was written on. This is the tier that replaced most of what tier 3
+       used to be asked to guess.
+    3. **Nearest-row fallback** (:func:`_proximity`) -- last resort, for a mark
+       whose centre lands in a band no row claims. Ranked behind everything via
+       ``_CENTROID_OFFSET``.
+
+    Tier 2 sits *below* tier 1 rather than above it, and that ordering is the
+    whole reason wrapping still works: a wrapped annotation is drawn a full
+    ``LINE_STEP`` below its own row, so it physically sits on the *next* row's
+    ruled line. Tier 1 reconstructs that placement and claims it first; only a
+    mark tier 1 cannot explain is handed to the band.
 
     Each mark keeps only its own single lowest-rank candidate. A row is *not*
     retired once matched: one CRF row legitimately carries more than one SDTM
@@ -974,10 +1010,11 @@ def match_marks_to_rows(
     several marks -- which is exactly the ``anno1``/``anno2`` shape the control
     sheet already has room for.
 
-    The tier-2 ambiguity that remains is narrower than it was. Rows are printed
-    lines, so candidates on a page are separated by a full line of leading rather
-    than by the few points that separated adjacent widgets in a grid; the case
-    where centroid distance picks the neighbour is correspondingly rarer.
+    The ambiguity that remains is narrower than it was, twice over. Rows are
+    printed lines, so candidates on a page are separated by a full line of
+    leading rather than by the few points that separated adjacent widgets in a
+    grid; and a mark on a row's own line is now settled by containment rather
+    than by comparing distances to two rows that are both close.
     ``match_distance`` still makes a bad tier-2 guess visible to whoever reviews
     the report -- as does ``placement``, which records *which* of these tiers
     produced the match rather than leaving a reader to infer it from a distance.
@@ -997,12 +1034,21 @@ def match_marks_to_rows(
             if aligned is not None:
                 score, placement, wraps = aligned
                 candidates.append(_Candidate(score, i, row.row_id, d, (), placement, wraps))
-            else:
-                near = _proximity(m.bbox, row.anchor)
-                if near <= max_distance:
-                    candidates.append(
-                        _Candidate(near + _CENTROID_OFFSET, i, row.row_id, d, (), "nearest", 0)
+                continue
+            near = _proximity(m.bbox, row.anchor)
+            if near > max_distance:
+                continue
+            if _in_band(m.bbox, row):
+                candidates.append(
+                    _Candidate(
+                        _BAND_OFFSET + near / _BAND_TIEBREAK,
+                        i, row.row_id, d, (), "band", 0,
                     )
+                )
+            else:
+                candidates.append(
+                    _Candidate(near + _CENTROID_OFFSET, i, row.row_id, d, (), "nearest", 0)
+                )
 
         grouped = _reverse_group_score(m.bbox, page_rows)
         if grouped is not None:
@@ -1185,14 +1231,24 @@ def parse_annotated_pdf(
     row extraction on a clean form cannot confuse annotation text for form text.
     Without it, rows are extracted from ``pdf_path`` itself.
 
-    That second case is worth being precise about, because it changed with the
-    row model. Annotations are FreeText *markup*, not page content, so
-    ``get_text("words")`` does not see them and the extracted rows are the
-    form's own text either way -- as long as nothing flattened the markup into
-    the page. This pipeline never flattens (see
-    ``render.save_with_annotations``); a third-party aCRF is not guaranteed to
-    make the same choice, and a flattened one will produce rows that include the
-    annotations, which then get matched against themselves.
+    That second case is worth being precise about, and the earlier version of
+    this note had it wrong. It claimed that annotations, being FreeText markup
+    rather than page content, are invisible to ``get_text("words")``. They are
+    not: on PyMuPDF 1.28.2 a page's annotation text comes back mixed into its
+    printed words, so a ``Year of Birth (yyyy)`` question carrying a
+    ``BRTHDTC`` mark extracted as the single row ``Year of Birth (yyyy)
+    BRTHDTC`` -- the question with its own answer glued on, used as the key for
+    every lookup row derived from it. ``rows.extract_rows`` now subtracts the
+    annotation layer geometrically before grouping anything
+    (``rows.annotation_rects``), which is what makes the no-blank path produce
+    the form's own text.
+
+    A **flattened** aCRF is the case that remains unfixable, since the marks are
+    page content by then and there are no annotation objects left to subtract.
+    It degrades safely rather than silently: ``read_marks`` finds nothing on such
+    a file either, so the outcome is "no mappings recovered" and not "mappings
+    recovered against contaminated labels". This pipeline never flattens (see
+    ``render.save_with_annotations``).
 
     Pass ``precedent`` (a variable -> domain table, typically from
     ``pipeline.corpus_precedent.build_variable_domain_precedent``) to give

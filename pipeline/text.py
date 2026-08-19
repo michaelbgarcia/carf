@@ -28,6 +28,26 @@ actually overlap) is *tighter* than the gap between two separate options in a
 list (1.6pt), which is in turn tighter than the gap between a banner and the
 line under it (2.9pt). No cutoff separates those three, so ``rows.py`` asks
 PyMuPDF instead of guessing. Hence ``block`` on every run.
+
+Lines are also *bands*, not just boxes
+--------------------------------------
+A line's glyph rect is only as tall as its own ink, which leaves the whitespace
+between two lines belonging to neither. :func:`line_bands` divides the page into
+one full-width horizontal band per line -- the ruled line of a notebook page --
+so that every y on the page belongs to exactly one line and the boundary between
+two questions is an explicit number rather than a matter of which glyph rect a
+point happens to fall nearest. ``rows.py`` carries it onto the row and
+``parse_annotated_pdf`` matches annotations against it.
+
+Annotation text is not page text
+--------------------------------
+It should not need saying, but on PyMuPDF 1.28.2 it does: ``get_text`` **does**
+return the text of a page's annotations, mixed in with the form's own printed
+words and indistinguishable from them once extracted. Measured, not assumed --
+an aCRF whose ``Year of Birth (yyyy)`` question carries a ``BRTHDTC`` mark
+extracts as the single line ``Year of Birth (yyyy) BRTHDTC``. So ``exclude``
+below is not a nicety: without it, reading a finished aCRF back keys its lookup
+table on question text with the answer glued onto the end of it.
 """
 
 from __future__ import annotations
@@ -39,6 +59,18 @@ from typing import Optional
 import pymupdf
 
 HEADING_RATIO = 1.35  # text this much taller than the page median is a heading
+
+#: How much of a word must lie inside an excluded rect before the word is
+#: dropped. A fraction rather than "intersects at all", because an annotation
+#: that merely grazes a printed word should not delete it -- the mark is what is
+#: unwanted, and a form's own text is not recoverable once discarded. Half a
+#: word inside an annotation's box is not a graze.
+MASK_CONTAINMENT = 0.5
+
+#: How far a band extends past the first and last line on a page, as a fraction
+#: of the median line height. There is no neighbour to split the difference with
+#: there, so the band gets half a line of its own.
+BAND_EDGE_FRACTION = 0.5
 
 
 @dataclass(frozen=True)
@@ -77,11 +109,28 @@ def clean_label(text: str) -> str:
     return " ".join(text.split()).rstrip(":").strip()
 
 
-def text_runs(page: pymupdf.Page) -> list[TextRun]:
+def _masked(rect: pymupdf.Rect, exclude: list[pymupdf.Rect]) -> bool:
+    """Whether ``rect`` lies far enough inside any excluded rect to be dropped."""
+    area = abs(rect.get_area())
+    if area <= 0:
+        return False
+    return any(abs((rect & m).get_area()) / area >= MASK_CONTAINMENT for m in exclude)
+
+
+def text_runs(
+    page: pymupdf.Page, exclude: Optional[list[pymupdf.Rect]] = None
+) -> list[TextRun]:
     """Group words into visual lines, then split each line at wide gaps.
 
     Returned in reading order (top to bottom, then left to right), which
     ``rows.py`` relies on: row ids are assigned in that order.
+
+    ``exclude`` is a list of rects whose contents are not the form's own text --
+    in practice the page's annotations, which ``get_text`` otherwise hands back
+    mixed in with it (see the module docstring). Words are dropped *before* line
+    grouping, so an annotation cannot merge into the line it sits beside and
+    cannot widen that line's rect either. A word is dropped only when
+    ``MASK_CONTAINMENT`` of it is inside; a graze leaves it alone.
     """
     # get_text("words") yields (x0, y0, x1, y1, word, block_no, line_no, word_no).
     words = [
@@ -89,6 +138,8 @@ def text_runs(page: pymupdf.Page) -> list[TextRun]:
         for w in page.get_text("words")
         if w[4].strip()
     ]
+    if exclude:
+        words = [w for w in words if not _masked(w[0], exclude)]
     if not words:
         return []
 
@@ -159,12 +210,66 @@ def line_rect(line: list[TextRun]) -> pymupdf.Rect:
     return out
 
 
+def _band_edge(prev: pymupdf.Rect, nxt: pymupdf.Rect) -> float:
+    """The ruled line between two consecutive text lines.
+
+    The midpoint of the space between them -- except that the space is
+    frequently negative. The two lines of one wrapped question overlap by a
+    measured 2.4pt (see the module docstring), so the "midpoint of the gap" can
+    land outside one of the boxes. Clamping it strictly between the two lines'
+    *centres* guarantees the one property the band model rests on: every line's
+    own centre lies inside its own band, so the bands really do partition the
+    page and a point cannot fall in two of them or in neither.
+    """
+    edge = (prev.y1 + nxt.y0) / 2.0
+    lo = (prev.y0 + prev.y1) / 2.0
+    hi = (nxt.y0 + nxt.y1) / 2.0
+    if lo >= hi:  # a tall line followed by a short one inside it
+        return (lo + hi) / 2.0
+    return min(max(edge, lo), hi)
+
+
+def line_bands(lines: list[list[TextRun]], page_rect: pymupdf.Rect) -> list[pymupdf.Rect]:
+    """One full-width horizontal band per line -- the ruled line each sits on.
+
+    Think of the light blue rules on notebook paper: every line of writing owns
+    the band it sits in, and the boundary between one question and the next is
+    the rule between them rather than a judgement about which glyph rect a stray
+    point is nearest.
+
+    Full page width on purpose. A band is not the line's bounding box -- that is
+    ``line_rect`` and it already exists. The band claims the whitespace to either
+    side too, which is what makes it useful: the gutter between the two text
+    columns is exactly where an annotation goes, and it belongs to the row on
+    whose rule it sits.
+
+    Returned one per input line, in the same order, with adjacent bands sharing
+    an edge and the first and last extending ``BAND_EDGE_FRACTION`` of a line
+    past the outermost text (clamped to the page).
+    """
+    if not lines:
+        return []
+    rects = [line_rect(line) for line in lines]
+    pad = BAND_EDGE_FRACTION * median(r.height for r in rects)
+
+    edges = [max(page_rect.y0, rects[0].y0 - pad)]
+    edges.extend(_band_edge(prev, nxt) for prev, nxt in zip(rects, rects[1:]))
+    edges.append(min(page_rect.y1, rects[-1].y1 + pad))
+    return [
+        pymupdf.Rect(page_rect.x0, edges[i], page_rect.x1, edges[i + 1])
+        for i in range(len(rects))
+    ]
+
+
 __all__ = [
+    "BAND_EDGE_FRACTION",
     "HEADING_RATIO",
+    "MASK_CONTAINMENT",
     "TextRun",
     "clean_label",
     "h_overlap",
     "headings",
+    "line_bands",
     "line_rect",
     "lines_of",
     "text_runs",

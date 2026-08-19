@@ -15,6 +15,7 @@ are asserted directly rather than through their downstream effects:
 from __future__ import annotations
 
 import json
+from statistics import median
 
 import pymupdf
 import pytest
@@ -24,12 +25,13 @@ from pipeline.geometry import bbox_to_fitz_rect
 from pipeline.rows import (
     FULL_WIDTH_FRACTION,
     MIN_COLUMN_RUNS,
+    annotation_rects,
     detect_gutter,
     extract_rows,
     form_name,
     splits_into_columns,
 )
-from pipeline.text import TextRun, text_runs
+from pipeline.text import TextRun, line_bands, lines_of, text_runs
 
 # Points. Extraction recovers the drawn insertion x to floating-point precision
 # (measured worst case across all 54 rows: 0.0000pt), so this is headroom for
@@ -356,3 +358,118 @@ def test_a_layout_shift_fails_the_truth_check(crfs, monkeypatch, tmp_path, truth
         "a 1pt shift did not move the extracted bbox past the tolerance, so the "
         "truth check cannot detect layout drift"
     )
+
+
+# --------------------------------------------------------------------------
+# Line bands -- the ruled lines rows sit on
+# --------------------------------------------------------------------------
+
+
+def test_every_row_sits_inside_its_own_band(rows_acroform):
+    """The property everything else here depends on: a row is on its own rule."""
+    for row in rows_acroform.rows:
+        assert row.band is not None, row.row_id
+        centre = (row.anchor.y0 + row.anchor.y1) / 2.0
+        assert row.band.y0 <= centre <= row.band.y1, row.row_id
+
+
+def test_bands_tile_the_page_without_gaps_or_overlaps(rows_acroform):
+    """Adjacent bands share an edge, so no point on the page belongs to neither.
+
+    This is what lets ``parse_annotated_pdf`` answer "which question is this
+    annotation for" by containment instead of by comparing distances.
+    """
+    by_page: dict[int, list] = {}
+    for row in rows_acroform.rows:
+        by_page.setdefault(row.page_index, []).append(row.band)
+
+    for page_index, bands in by_page.items():
+        bands.sort(key=lambda b: -b.y1)  # PDF user space: y up, so top first
+        for upper, lower in zip(bands, bands[1:]):
+            assert upper.y0 == pytest.approx(lower.y1, abs=1e-4), page_index
+
+
+def test_a_band_is_wider_than_the_text_on_it(rows_acroform):
+    """A band claims the whitespace around the row, not just its ink.
+
+    Specifically the gutter, which is where annotations go and which no glyph
+    rect covers.
+    """
+    page = rows_acroform.page(0)
+    row = next(r for r in rows_acroform.rows if r.text_1 == "Sex")
+    assert row.band.x0 <= row.anchor.x0 and row.band.x1 >= row.anchor.x1
+    assert row.band.x1 == pytest.approx(page.width)
+    assert row.band.height > row.anchor.height
+
+
+def test_a_wrapped_question_owns_both_of_its_rules(rows_acroform):
+    """A merged row's band is the union of its lines', not just the first one's.
+
+    Otherwise the continuation line's territory belongs to no row at all, and a
+    mark written beside the second half of a two-line question falls into a gap.
+    """
+    wrapped = next(
+        r for r in rows_acroform.rows if r.text_1.startswith("If Yes, please provide")
+    )
+    singles = [
+        r.band.height
+        for r in rows_acroform.rows
+        if r.page_index == wrapped.page_index and r.band is not None and r is not wrapped
+    ]
+    assert wrapped.band.height > 1.5 * median(singles)
+
+
+def test_bands_are_returned_one_per_line_in_order(crfs):
+    """``line_bands`` is positional -- ``rows.py`` zips it against the lines."""
+    doc = pymupdf.open(crfs["acroform"])
+    try:
+        page = doc[0]
+        lines = lines_of(text_runs(page))
+        bands = line_bands(lines, page.rect)
+        assert len(bands) == len(lines)
+        assert bands == sorted(bands, key=lambda b: b.y0)
+    finally:
+        doc.close()
+
+
+def test_line_bands_of_nothing_is_nothing():
+    """A page with no text has no rules on it -- not one band spanning the page."""
+    assert line_bands([], pymupdf.Rect(0, 0, 612, 792)) == []
+
+
+# --------------------------------------------------------------------------
+# Annotation masking -- labels are the form's text, never a mark's
+# --------------------------------------------------------------------------
+
+
+def test_a_blank_crf_has_nothing_to_mask(rows_acroform, crfs):
+    """Masking is on by default and must be a no-op on a form that is really blank."""
+    assert all(p.masked_annotations == 0 for p in rows_acroform.pages)
+    unmasked = extract_rows(crfs["acroform"], mask_annotations=False)
+    assert [r.text_1 for r in rows_acroform.rows] == [r.text_1 for r in unmasked.rows]
+
+
+def test_annotation_rects_ignores_markup_that_carries_no_text(crfs, tmp_path):
+    """A bracket or any other purely graphical annot must not mask real text.
+
+    It spans a whole block of rows, so excluding it on subtype would delete the
+    question text underneath it.
+    """
+    from pipeline.models import BBox
+    from pipeline.render import draw_group_bracket, save_with_annotations
+
+    doc = pymupdf.open(crfs["acroform"])
+    try:
+        draw_group_bracket(
+            doc[0], BBox(x0=90, y0=600, x1=250, y1=700), BBox(x0=270, y0=640, x1=330, y1=652)
+        )
+        out = tmp_path / "bracketed.pdf"
+        save_with_annotations(doc, out)
+    finally:
+        doc.close()
+
+    with pymupdf.open(out) as bracketed:
+        assert annotation_rects(bracketed[0]) == []
+    assert [r.text_1 for r in extract_rows(out).rows] == [
+        r.text_1 for r in extract_rows(crfs["acroform"]).rows
+    ]

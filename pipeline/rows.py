@@ -71,7 +71,7 @@ import pymupdf
 
 from pipeline.geometry import fitz_rect_to_bbox
 from pipeline.models import CRFRow, PageGeometry, RowSet
-from pipeline.text import TextRun, lines_of, text_runs
+from pipeline.text import TextRun, line_bands, lines_of, text_runs
 
 # --- Gutter detection -----------------------------------------------------
 #
@@ -235,6 +235,7 @@ class _Record:
     parts_1: list[str] = dc_field(default_factory=list)
     parts_2: list[str] = dc_field(default_factory=list)
     blocks_1: frozenset[int] = frozenset()
+    band: Optional[pymupdf.Rect] = None
     full_width: bool = False
 
     @property
@@ -302,9 +303,43 @@ def _merge_wrapped(records: list[_Record]) -> list[_Record]:
             prev.rect_1 |= rec.rect_1
             prev.parts_1.extend(rec.parts_1)
             prev.blocks_1 = prev.blocks_1 | rec.blocks_1
+            # A wrapped question owns every rule it is written across, so the
+            # merged row's band is the union. Leaving the first line's band
+            # would strand the continuation line's territory between two rows,
+            # belonging to neither.
+            if rec.band is not None:
+                prev.band = rec.band if prev.band is None else (prev.band | rec.band)
             continue
         out.append(rec)
     return out
+
+
+# --------------------------------------------------------------------------
+# Annotation masking
+# --------------------------------------------------------------------------
+
+
+def annotation_rects(page: pymupdf.Page) -> list[pymupdf.Rect]:
+    """Rects of this page's text-carrying annotations -- what is *not* form text.
+
+    Needed because ``get_text`` does not distinguish the two: on PyMuPDF 1.28.2 a
+    page's annotation text comes back mixed into its printed words (measured --
+    see ``text.py``'s docstring). Without subtracting these, reading a finished
+    aCRF back produces labels like ``Year of Birth (yyyy) BRTHDTC``: the question
+    with its own answer appended, which then becomes the key the whole corpus
+    lookup table is built on.
+
+    Filtered on **non-empty ``/Contents``** rather than on subtype. That is the
+    property that matters -- an annotation with no text cannot have contributed
+    any -- and it is also what keeps the purely graphical markup this codebase
+    draws from masking anything: ``render.draw_group_bracket``'s polyline spans
+    a whole block of rows vertically, and excluding its rect on the strength of
+    its subtype would delete real question text along a 3pt-wide column.
+
+    ``page.annots()`` does not return form widgets, so a CRF's own capture fields
+    are unaffected either way.
+    """
+    return [a.rect for a in page.annots() if (a.info.get("content") or "").strip()]
 
 
 # --------------------------------------------------------------------------
@@ -338,18 +373,43 @@ def form_name(runs: list[TextRun], pattern: Pattern[str] = FORM_HEADER_RE) -> Op
 @dataclass
 class _PageScan:
     page_index: int
-    width: float
-    height: float
+    rect: pymupdf.Rect
     rotation: int
     runs: list[TextRun]
     own_gutter: Optional[float]
     own_form: Optional[str]
+    masked: int = 0  # text-carrying annotations subtracted from this page
+
+    @property
+    def width(self) -> float:
+        return self.rect.width
+
+    @property
+    def height(self) -> float:
+        return self.rect.height
 
 
 def extract_rows(
-    pdf_path: str | Path, form_header_pattern: Pattern[str] = FORM_HEADER_RE
+    pdf_path: str | Path,
+    form_header_pattern: Pattern[str] = FORM_HEADER_RE,
+    *,
+    mask_annotations: bool = True,
 ) -> RowSet:
     """Read a blank CRF into two-column rows.
+
+    ``mask_annotations`` subtracts the page's own annotation text before any
+    grouping happens (:func:`annotation_rects`), so a row's text is the *form's*
+    text and never a mark drawn on top of it. It defaults on, and on a genuinely
+    blank CRF it changes nothing -- there are no annotations to subtract. It
+    earns its keep on the reverse direction, where ``parse_annotated_pdf`` reads
+    rows off a finished aCRF because no blank counterpart was supplied. Pass
+    ``False`` only to see what the unfiltered extraction would have produced.
+
+    The one case it cannot help with is a **flattened** aCRF, where the marks
+    were baked into page content and no annotation objects survive to locate.
+    That degrades safely rather than silently, though: ``read_marks`` finds
+    nothing on such a file either, so the result is "no mappings recovered"
+    rather than "mappings recovered against contaminated labels".
 
     Two passes over the pages, because the second needs a document-wide fact
     the first produces. A page whose own gutter detection fails -- dense enough
@@ -367,16 +427,17 @@ def extract_rows(
     try:
         scans: list[_PageScan] = []
         for i, page in enumerate(doc):
-            runs = text_runs(page)
+            exclude = annotation_rects(page) if mask_annotations else []
+            runs = text_runs(page, exclude=exclude)
             scans.append(
                 _PageScan(
                     page_index=i,
-                    width=page.rect.width,
-                    height=page.rect.height,
+                    rect=pymupdf.Rect(page.rect),
                     rotation=page.rotation,
                     runs=runs,
                     own_gutter=detect_gutter(runs, page.rect.width),
                     own_form=form_name(runs, form_header_pattern),
+                    masked=len(exclude),
                 )
             )
 
@@ -404,14 +465,18 @@ def extract_rows(
                     height=scan.height,
                     rotation=scan.rotation,
                     gutter_x=gutter,
+                    masked_annotations=scan.masked,
                 )
             )
 
-            records = [
-                rec
-                for rec in (_assemble_line(line, gutter) for line in lines_of(scan.runs))
-                if rec is not None
-            ]
+            lines = lines_of(scan.runs)
+            records = []
+            for line, band in zip(lines, line_bands(lines, scan.rect)):
+                rec = _assemble_line(line, gutter)
+                if rec is None:
+                    continue
+                rec.band = band
+                records.append(rec)
             for n, rec in enumerate(_merge_wrapped(records), start=1):
                 rows.append(
                     CRFRow(
@@ -430,6 +495,11 @@ def extract_rows(
                             if rec.rect_2 is not None
                             else None
                         ),
+                        band=(
+                            fitz_rect_to_bbox(rec.band, scan.height)
+                            if rec.band is not None
+                            else None
+                        ),
                         full_width=rec.full_width,
                     )
                 )
@@ -446,6 +516,7 @@ __all__ = [
     "GUTTER_SEARCH_BAND",
     "MIN_COLUMN_RUNS",
     "MIN_GUTTER_WIDTH",
+    "annotation_rects",
     "detect_gutter",
     "extract_rows",
     "form_name",
