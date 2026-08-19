@@ -314,6 +314,27 @@ the **page legend's colour key** (`legend_color_map`) — an explicit assertion
 printed on the page that this colour means this domain, ranked above the
 built-in CDISC constants for exactly that reason.
 
+**Position is reported in both frames, and styling alongside it.** The report
+carries each mark's absolute rect *and* its offset from the row it annotates,
+because they answer different questions. The absolute rect locates the mark and
+needs the page size beside it to mean anything; it transfers to no other
+document. The offsets — `dx_from_text`, `dy_from_text`, `placement` — are what
+generalise, since `place_row` puts every mark at `anchor.x1 + GAP` on the row's
+own baseline whatever the study or page size, so a third-party aCRF's numbers
+are directly comparable against this pipeline's own. Expect `GAP - 0.5`, not
+`GAP`: the offsets are measured on the rect the PDF *stores*, which a border
+inflates by half its width.
+
+The styling columns (font, size, weight, text and fill colours, border style,
+opacity, print flags, `/RC` rich text) are recorded and never branched on. They
+are there because MSG v2.0 constrains appearance as much as content — its only
+mapping-versus-comment distinction *is* a border style — and because the defects
+they expose are the ones nobody sees by looking: an annotation with the print
+flag clear is absent from the submitted document while looking perfect on
+screen, and text that lives in a rich-text stream rather than in `/Contents` is
+not searchable by the review tools. A derived page-domain summary row reports
+neither: it was never drawn.
+
 ## Coordinates
 
 PyMuPDF uses a **top-left origin, y increasing downward**. XFDF and the PDF spec

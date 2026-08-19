@@ -42,6 +42,23 @@ domain banner with a border. Under MSG every mark is bordered and black, so the
 older signals have to be checked last or they invert the classification
 completely. A source drawing its aCRFs some third way needs those heuristics
 re-tuned; the position matching underneath does not change.
+
+Position and styling are recorded as well as used
+-------------------------------------------------
+Everything above is *interpretation* -- text into a mapping, geometry into a row
+match. Two further groups of columns are recorded and never branched on, because
+a corpus cannot be QC'd against the guidelines without them coming out:
+
+* **Where the mark is, in both frames.** The absolute rect locates it (and needs
+  the page size beside it to mean anything); the offsets from the matched row --
+  ``dx_from_text``, ``dy_from_text``, ``placement`` -- are what generalise, since
+  ``layout.place_row`` puts every mark this pipeline draws at ``anchor.x1 + GAP``
+  on the row's own baseline whatever the study or the page size. See
+  :func:`_position_cells`.
+* **How it is drawn** -- font, size, colours, border, opacity, and the flags that
+  decide whether it prints at all. MSG v2.0 constrains appearance as much as
+  content, and its only mapping-versus-comment distinction *is* a border style.
+  See :class:`MarkStyle`.
 """
 
 from __future__ import annotations
@@ -50,7 +67,7 @@ import csv
 import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import pymupdf
 
@@ -63,7 +80,34 @@ DEFAULT_MAX_MATCH_DISTANCE = 200.0  # points; layout.py's own moves are well und
 _GRAYSCALE_TOLERANCE = 0.08  # max channel spread that still counts as "gray"
 _GRAY_CEILING = 0.9  # near-white text would also read as "gray"; exclude it
 
-_DA_COLOR_RE = re.compile(r"([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+rg")
+# A FreeText annot's *text* styling is not exposed as any high-level PyMuPDF
+# property. It lives in the ``/DA`` (default appearance) string -- a fragment of
+# a content stream, e.g. ``0 0 0 rg /Helv 7.0 Tf`` -- so colour, font and size
+# all have to be read back out of it by hand. Three colour operators are
+# accepted, because a third-party aCRF is under no obligation to have used RGB:
+# ``rg``, ``g`` (grayscale) and ``k`` (CMYK) all occur, and a grey note written
+# as ``0.5 g`` would otherwise read as stating no colour at all -- and so not as
+# a note (see :func:`_is_muted`).
+_DA_RGB_RE = re.compile(r"([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+rg")
+_DA_CMYK_RE = re.compile(r"([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+k(?![A-Za-z])")
+_DA_GRAY_RE = re.compile(r"([\d.]+)\s+g(?![A-Za-z])")
+_DA_FONT_RE = re.compile(r"/([^\s/]+)\s+([\d.]+)\s+Tf")
+
+#: PDF carries no numeric font weight for a FreeText annot -- ``/DA`` names a
+#: font *resource*, and that name is the only signal there is. Both spellings
+#: that turn up are matched: the descriptive one ("Helvetica-Bold",
+#: "Arial,BoldItalic") and the base-14 shorthand ("hebo", "cobi") that PyMuPDF
+#: writes, which is what this pipeline's own output carries.
+_BOLD_WORDS = ("bold", "black", "heavy", "semibold", "demi")
+_ITALIC_WORDS = ("italic", "oblique")
+_BASE14_BOLD = {"hebo", "hebi", "cobo", "cobi", "tibo", "tibi"}
+_BASE14_ITALIC = {"heit", "hebi", "coit", "cobi", "tiit", "tibi"}
+
+# PDF 32000-1 table 165, annotation flags. Only the three that decide whether a
+# mark reaches a reviewer at all are named here.
+_FLAG_HIDDEN = 2
+_FLAG_PRINT = 4
+_FLAG_NOVIEW = 32
 _MAPPING_RE = re.compile(
     r"^\s*(?:(?P<domain>[A-Za-z]{2,8})\.(?P<var_with_domain>[A-Za-z0-9_]+)"
     r"|(?P<var_alone>[A-Za-z0-9_]+))"
@@ -78,6 +122,58 @@ _MAPPING_RE = re.compile(
 
 
 @dataclass(frozen=True)
+class MarkStyle:
+    """How a mark is *drawn*, recorded rather than interpreted.
+
+    Deliberately separate from ``RawMark``'s ``fill``/``boxed``/``dashed``, which
+    exist to *classify* a mark and are load-bearing in :func:`classify_mark`.
+    Nothing in this module branches on anything below; it is carried through to
+    the report and no further.
+
+    It is carried at all because Metadata Submission Guidelines v2.0 constrains
+    an aCRF's appearance as well as its content, and a corpus cannot be checked
+    against those rules without the numbers coming out. Specifically:
+
+    * ``font``/``font_size``/``bold``/``italic``/``text_color`` -- annotation text
+      has to be legible and consistent across a submission. A corpus where one
+      form annotates at 7pt and another at 4pt is a finding, and it is invisible
+      unless the size is recorded.
+    * ``border_width``/``border_style``/``border_color`` -- MSG's *only*
+      distinction between a mapping and a comment is a dashed border, so the
+      border is semantic here, not decorative.
+    * ``printable``/``hidden`` -- an annotation with the print flag clear is not
+      in the submitted document at all, however correct it looks on screen. This
+      is the cheapest real defect to detect and the easiest to miss.
+    * ``rich_text`` -- ``/RC`` present means the visible text may live in a
+      rich-text stream rather than in ``/Contents``, which breaks the text
+      searchability FDA review tools rely on (see ``render.py``'s docstring,
+      where this is measured).
+    * ``opacity``/``rotation`` -- a translucent or rotated mark reproduces badly
+      in print and in a flattened review copy.
+    * ``author``/``subject``/``modified`` -- the annotation layer's own provenance,
+      which is the only audit trail a finished third-party aCRF carries.
+    """
+
+    subtype: str = "FreeText"
+    text_color: Optional[tuple[float, float, float]] = None  # RGB 0..1, from /DA
+    font: Optional[str] = None  # font *resource* name, e.g. "Helv"
+    font_size: Optional[float] = None  # points
+    bold: bool = False  # inferred from the font name -- see _font_weight
+    italic: bool = False
+    border_width: float = 0.0
+    border_style: str = "none"  # "none" | "solid" | "dashed"
+    border_color: Optional[tuple[float, float, float]] = None  # Square only; see _mark_colors
+    opacity: float = 1.0  # /CA; 1.0 when the annot states none
+    rotation: int = 0  # /Rotate, degrees
+    printable: bool = True  # /F print bit clear = drawn on screen, absent from paper
+    hidden: bool = False  # /F hidden or noview
+    rich_text: bool = False  # /RC present -- text may not be in /Contents
+    author: str = ""  # /T
+    subject: str = ""  # /Subj
+    modified: str = ""  # /M, verbatim PDF date string
+
+
+@dataclass(frozen=True)
 class RawMark:
     """One FreeText/Square annotation, read straight off the page -- no interpretation yet."""
 
@@ -87,26 +183,139 @@ class RawMark:
     boxed: bool  # non-zero border width
     muted: bool  # grayscale text color
     dashed: bool = False  # dashed border -- MSG's marker for a comment note
-    fill: Optional[tuple[float, float, float]] = None  # /C background, 0..1 per channel
+    fill: Optional[tuple[float, float, float]] = None  # background, 0..1 per channel
+    #: The page's own dimensions, PDF user space. Carried on the mark because an
+    #: absolute rect is uninterpretable without them -- "x0 = 512" says nothing
+    #: until you know whether the page is 612pt or 842pt wide.
+    page_width: float = 0.0
+    page_height: float = 0.0
+    style: MarkStyle = field(default_factory=MarkStyle)
+
+
+def _da_text_color(da: Optional[tuple]) -> Optional[tuple[float, float, float]]:
+    """The text colour stated in a ``/DA`` string, as RGB 0..1, or ``None``.
+
+    Read from the raw ``/DA`` via ``xref_get_key`` rather than from
+    ``Annot.colors`` -- PyMuPDF's high-level ``colors`` covers a FreeText annot's
+    border/interior, never its text colour, which lives only here.
+
+    Grayscale and CMYK are converted rather than reported in their own space, so
+    every colour this module carries downstream is one comparable triple and
+    ``#7A7A7A`` written three different ways compares equal.
+    """
+    if not da or da[0] != "string":
+        return None
+    text = da[1]
+    m = _DA_RGB_RE.search(text)
+    if m:
+        return tuple(float(v) for v in m.groups())  # type: ignore[return-value]
+    m = _DA_CMYK_RE.search(text)
+    if m:
+        c, mag, yel, k = (float(v) for v in m.groups())
+        return ((1 - c) * (1 - k), (1 - mag) * (1 - k), (1 - yel) * (1 - k))
+    m = _DA_GRAY_RE.search(text)
+    if m:
+        v = float(m.group(1))
+        return (v, v, v)
+    return None
+
+
+def _da_font(da: Optional[tuple]) -> tuple[Optional[str], Optional[float]]:
+    """``(font resource name, size in points)`` from a ``/DA`` string."""
+    if not da or da[0] != "string":
+        return None, None
+    m = _DA_FONT_RE.search(da[1])
+    if not m:
+        return None, None
+    try:
+        return m.group(1), float(m.group(2))
+    except ValueError:  # pragma: no cover - the regex admits only digits and dots
+        return m.group(1), None
+
+
+def _font_weight(name: Optional[str]) -> tuple[bool, bool]:
+    """``(bold, italic)`` inferred from a font resource name -- see ``_BOLD_WORDS``.
+
+    Inferred, and reported as such: this is a read of a *name*, not of a weight
+    axis, because a FreeText annot has no weight to read.
+    """
+    if not name:
+        return False, False
+    key = name.lower()
+    bold = key in _BASE14_BOLD or any(w in key for w in _BOLD_WORDS)
+    italic = key in _BASE14_ITALIC or any(w in key for w in _ITALIC_WORDS)
+    return bold, italic
 
 
 def _is_muted(da: Optional[tuple]) -> bool:
     """Grayscale text color reads as a muted/not-submitted mark.
 
-    Reads the raw ``/DA`` (default appearance) string via ``xref_get_key``
-    rather than ``Annot.colors`` -- PyMuPDF's high-level ``colors`` covers a
-    FreeText annot's border/interior, not its text color, which lives only in
-    DA. Grayscale rather than an exact hex match against this codebase's own
+    Grayscale rather than an exact hex match against this codebase's own
     ``#7A7A7A``, so a source that picked a different but still-neutral note
     color is still recognised.
     """
-    if not da or da[0] != "string":
+    color = _da_text_color(da)
+    if color is None:
         return False
-    m = _DA_COLOR_RE.search(da[1])
-    if not m:
-        return False
-    r, g, b = (float(v) for v in m.groups())
+    r, g, b = color
     return max(r, g, b) - min(r, g, b) <= _GRAYSCALE_TOLERANCE and max(r, g, b) < _GRAY_CEILING
+
+
+def _mark_colors(
+    annot: "pymupdf.Annot", subtype: str
+) -> tuple[Optional[tuple[float, float, float]], Optional[tuple[float, float, float]]]:
+    """``(background, border colour)`` -- which PDF key holds which depends on the subtype.
+
+    The asymmetry is the whole reason this is a function. On a **FreeText** annot
+    ``/C`` is the *background*, which PyMuPDF reports back under ``"stroke"``
+    (see ``render.py``); its border takes the text colour and has no key of its
+    own. On a **Square** ``/C`` is the *border* and ``/IC`` the interior -- the
+    opposite way round. Reading ``"stroke"`` as the fill for both would report a
+    Square's border colour as its background, and :func:`classify_mark` would
+    then read any bordered Square as a domain-coloured mapping.
+    """
+    colors = annot.colors
+    stroke = tuple(colors.get("stroke") or ()) or None
+    interior = tuple(colors.get("fill") or ()) or None
+    if subtype == "Square":
+        return interior, stroke  # type: ignore[return-value]
+    return stroke, None  # type: ignore[return-value]
+
+
+def _read_style(doc: "pymupdf.Document", annot: "pymupdf.Annot", subtype: str, da) -> MarkStyle:
+    """Every presentation attribute :class:`MarkStyle` records, off one annotation."""
+    border = annot.border
+    width = float(border.get("width") or 0.0)
+    dashed = bool(border.get("dashes"))
+    font, size = _da_font(da)
+    bold, italic = _font_weight(font)
+    flags = int(annot.flags or 0)
+    rotate = doc.xref_get_key(annot.xref, "Rotate")
+    rich = doc.xref_get_key(annot.xref, "RC")
+    info = annot.info
+    opacity = annot.opacity
+    return MarkStyle(
+        subtype=subtype,
+        text_color=_da_text_color(da),
+        font=font,
+        font_size=size,
+        bold=bold,
+        italic=italic,
+        border_width=width,
+        border_style=("dashed" if dashed else "solid") if width > 0 else "none",
+        border_color=_mark_colors(annot, subtype)[1],
+        # PyMuPDF returns -1 for "the annot has no /CA entry", which the spec
+        # reads as fully opaque -- not as transparent, and not as unknown.
+        opacity=1.0 if opacity is None or opacity < 0 else float(opacity),
+        rotation=int(rotate[1]) if rotate and rotate[0] == "int" else 0,
+        printable=bool(flags & _FLAG_PRINT),
+        hidden=bool(flags & (_FLAG_HIDDEN | _FLAG_NOVIEW)),
+        rich_text=bool(rich and rich[0] != "null"),
+        # PyMuPDF calls /T "title"; in an annotation /T is the author.
+        author=(info.get("title") or "").strip(),
+        subject=(info.get("subject") or "").strip(),
+        modified=(info.get("modDate") or "").strip(),
+    )
 
 
 def read_marks(pdf_path: str | Path) -> list[RawMark]:
@@ -124,16 +333,15 @@ def read_marks(pdf_path: str | Path) -> list[RawMark]:
         for page_index, page in enumerate(doc):
             height = page.rect.height
             for annot in page.annots():
-                if annot.type[1] not in ("FreeText", "Square"):
+                subtype = annot.type[1]
+                if subtype not in ("FreeText", "Square"):
                     continue
                 text = (annot.info.get("content") or "").strip()
                 if not text:
                     continue
                 da = doc.xref_get_key(annot.xref, "DA")
                 border = annot.border
-                # On a FreeText annot the background lives in /C, which PyMuPDF
-                # reports back under "stroke" -- see render.py's docstring.
-                fill = annot.colors.get("stroke") or None
+                fill, _ = _mark_colors(annot, subtype)
                 out.append(
                     RawMark(
                         page_index=page_index,
@@ -142,7 +350,10 @@ def read_marks(pdf_path: str | Path) -> list[RawMark]:
                         boxed=border.get("width", 0.0) > 0.0,
                         muted=_is_muted(da),
                         dashed=bool(border.get("dashes")),
-                        fill=tuple(fill) if fill else None,
+                        fill=fill,
+                        page_width=page.rect.width,
+                        page_height=height,
+                        style=_read_style(doc, annot, subtype, da),
                     )
                 )
         return out
@@ -319,6 +530,7 @@ class RecoveredMapping:
     condition: Optional[str] = None
     fixed_value: Optional[str] = None  # e.g. "PROTOCOL MILESTONE" from "DSCAT = PROTOCOL MILESTONE"
     fill: Optional[tuple[float, float, float]] = None  # the mark's own background, for the legend-colour tier
+    style: MarkStyle = field(default_factory=MarkStyle)  # how it was drawn -- see MarkStyle
     domain_inferred: bool = False  # True if `domain` did not come from this mark's own text
     domain_inference_source: Optional[str] = None  # "banner" | "legend" | "builtin" | "precedent"
     row_id: Optional[str] = None
@@ -331,6 +543,22 @@ class RecoveredMapping:
     label: Optional[str] = None  # the matched row's text_1 -- the lookup key
     context: Optional[str] = None  # form and response column, for disambiguation
     match_distance: Optional[float] = None  # points, centre-to-centre; None if unmatched
+    #: --- Where the mark sits. Both frames are kept, because they answer
+    #: different questions (see :func:`_position_cells`): the page size makes the
+    #: mark's own absolute ``bbox`` interpretable, while the offsets below are
+    #: what generalise across documents.
+    page_width: Optional[float] = None
+    page_height: Optional[float] = None
+    #: Which shape of ``layout`` placement the match was recognised as:
+    #: "slot1" | "slot2" | "wrap" | "group" | "nearest". "nearest" is the tier-2
+    #: fallback -- no reconstructed placement, just the closest row -- and is the
+    #: value to filter on when asking how much of a corpus follows this
+    #: convention at all.
+    placement: Optional[str] = None
+    wrap_lines: Optional[int] = None  # LINE_STEPs below the row's baseline; 0 unless wrapped
+    dx_from_text: Optional[float] = None  # mark.x0 - anchor.x1: the gap past the question text
+    dy_from_text: Optional[float] = None  # mark.y0 - anchor.y0: 0.0 means on the row's own baseline
+    dx_from_gutter: Optional[float] = None  # mark.x0 - page.gutter_x; None on a single-column page
     synthesized: bool = False  # True only for summarize_page_domains' derived page-domain rows
     legend_name: Optional[str] = None  # cross-check: this domain's name in the page's own legend, if any
     source_pdf: Optional[str] = None  # filename, set by pipeline.corpus_precedent when mining a corpus
@@ -418,6 +646,9 @@ def _mark_to_mapping(mark: RawMark) -> RecoveredMapping:
         text=mark.text,
         kind=kind,
         fill=mark.fill,
+        style=mark.style,
+        page_width=mark.page_width or None,
+        page_height=mark.page_height or None,
         domain=domain,
         variable=variable,
         condition=condition,
@@ -573,9 +804,9 @@ _STEP_TOL = 1e-3  # tolerance on (delta / LINE_STEP) being an integer
 _CENTROID_OFFSET = layout.MAX_WRAPS + 10.0
 
 
-def _reverse_layout_score(mark_bbox: BBox, row: CRFRow) -> Optional[float]:
-    """Score of 0..~6 if `mark_bbox` is exactly where ``layout.place_row`` would
-    have put an annotation for `row`; ``None`` otherwise.
+def _reverse_layout_score(mark_bbox: BBox, row: CRFRow) -> Optional[tuple[float, str, int]]:
+    """``(score, placement, wrap_lines)`` if `mark_bbox` is exactly where
+    ``layout.place_row`` would have put an annotation for `row`; ``None`` otherwise.
 
     Reconstructing that placement is nearly trivial, which is the payoff of
     anchoring annotations to text instead of searching for a free spot. There are
@@ -592,18 +823,24 @@ def _reverse_layout_score(mark_bbox: BBox, row: CRFRow) -> Optional[float]:
     left, then a forty-step downward walk) because placement was a search. A
     lower score is a better match, used only to break ties; any exact alignment
     outranks every nearest-centroid fallback (see ``_CENTROID_OFFSET``).
+
+    ``placement`` names which of those shapes matched ("slot1" | "slot2" |
+    "wrap"), and ``wrap_lines`` how many ``LINE_STEP``s down it was found. Those
+    are returned rather than re-derived from the score by the caller: the score
+    is a ranking number whose encoding is free to change, and a consumer reading
+    "wrap" out of a report should not depend on it having been 3.0.
     """
     anchor = row.anchor
     on_baseline_x0 = anchor.x1 + layout.GAP
 
     if abs(mark_bbox.y0 - anchor.y0) <= _ALIGN_TOL:
         if abs(mark_bbox.x0 - on_baseline_x0) <= _ALIGN_TOL:
-            return 0.0
+            return (0.0, "slot1", 0)
         # Slot 2 follows slot 1 on the same baseline. Its exact x depends on the
         # width of text this function cannot see, so the test is "on this row's
         # line, somewhere to the right of where slot 1 starts".
         if mark_bbox.x0 > on_baseline_x0:
-            return 0.5
+            return (0.5, "slot2", 0)
 
     # Wrapped: same indent as the question, a whole number of lines down.
     if abs(mark_bbox.x0 - anchor.x0) <= _ALIGN_TOL:
@@ -611,7 +848,7 @@ def _reverse_layout_score(mark_bbox: BBox, row: CRFRow) -> Optional[float]:
         if delta > 0:
             k = delta / layout.LINE_STEP
             if abs(k - round(k)) <= _STEP_TOL and 1 <= round(k) <= layout.MAX_WRAPS:
-                return float(round(k))
+                return (float(round(k)), "wrap", int(round(k)))
     return None
 
 
@@ -687,6 +924,25 @@ def _reverse_group_score(
     return None
 
 
+class _Candidate(NamedTuple):
+    """One possible (mark, row) pairing, before any of them are chosen.
+
+    ``rank`` decides match order -- tier 1 always ahead of tier 2 -- and is a
+    wrap count, a group score or a clamped proximity depending on which produced
+    it. ``distance`` is always plain centre-to-centre, kept separately so
+    ``match_distance`` stays a single comparable number in the report whichever
+    tier won. ``members`` is non-empty only for a grouped match.
+    """
+
+    rank: float
+    mark_index: int
+    row_id: str
+    distance: float
+    members: tuple[str, ...]
+    placement: str
+    wrap_lines: int
+
+
 def match_marks_to_rows(
     mappings: list[RecoveredMapping],
     rows: RowSet,
@@ -723,19 +979,14 @@ def match_marks_to_rows(
     than by the few points that separated adjacent widgets in a grid; the case
     where centroid distance picks the neighbour is correspondingly rarer.
     ``match_distance`` still makes a bad tier-2 guess visible to whoever reviews
-    the report.
+    the report -- as does ``placement``, which records *which* of these tiers
+    produced the match rather than leaving a reader to infer it from a distance.
     """
     rows_by_page: dict[int, list[CRFRow]] = {}
     for row in rows.rows:
         rows_by_page.setdefault(row.page_index, []).append(row)
 
-    # (rank, mark_index, row_id, reported_distance, members) -- `rank` decides
-    # match order (tier 1 always ahead of tier 2) and is a wrap count, a group
-    # score or a clamped proximity; `reported_distance` is always plain
-    # centre-to-centre, kept separately so ``match_distance`` stays a single
-    # comparable number in the report whichever tier produced the match.
-    # `members` is non-empty only for a grouped match.
-    candidates: list[tuple[float, int, str, float, tuple[str, ...]]] = []
+    candidates: list[_Candidate] = []
     for i, m in enumerate(mappings):
         if m.kind == "domain":
             continue
@@ -744,11 +995,14 @@ def match_marks_to_rows(
             d = _distance(m.bbox, row.anchor)
             aligned = _reverse_layout_score(m.bbox, row)
             if aligned is not None:
-                candidates.append((aligned, i, row.row_id, d, ()))
+                score, placement, wraps = aligned
+                candidates.append(_Candidate(score, i, row.row_id, d, (), placement, wraps))
             else:
                 near = _proximity(m.bbox, row.anchor)
                 if near <= max_distance:
-                    candidates.append((near + _CENTROID_OFFSET, i, row.row_id, d, ()))
+                    candidates.append(
+                        _Candidate(near + _CENTROID_OFFSET, i, row.row_id, d, (), "nearest", 0)
+                    )
 
         grouped = _reverse_group_score(m.bbox, page_rows)
         if grouped is not None:
@@ -756,40 +1010,89 @@ def match_marks_to_rows(
             anchor = rows.by_id(members[0])
             assert anchor is not None  # members come from this page's own rows
             candidates.append(
-                (score, i, members[0], _distance(m.bbox, anchor.anchor), tuple(members))
+                _Candidate(
+                    score, i, members[0], _distance(m.bbox, anchor.anchor),
+                    tuple(members), "group", 0,
+                )
             )
-    candidates.sort(key=lambda t: t[0])
+    candidates.sort(key=lambda c: c.rank)
 
-    chosen: dict[int, tuple[str, float, tuple[str, ...]]] = {}
-    for _rank, i, row_id, d, members in candidates:
-        if i in chosen:
-            continue
-        chosen[i] = (row_id, d, members)
+    chosen: dict[int, _Candidate] = {}
+    for c in candidates:
+        chosen.setdefault(c.mark_index, c)
 
     out: list[RecoveredMapping] = []
     for i, m in enumerate(mappings):
         if i not in chosen:
             out.append(m)
             continue
-        row_id, dist, members = chosen[i]
+        c = chosen[i]
         # One box covering five rows becomes five records sharing one bbox. Each
         # carries its own row's label, which is what the lookup table is keyed
         # on, and `member_row_ids` so a consumer can still tell they were drawn
         # once. Collapsing them back into one box is `grouping.collapse_repeats`'
         # job on the way out, and it will, because the text is identical.
-        for member_id in members or (row_id,):
+        for member_id in c.members or (c.row_id,):
             row = rows.by_id(member_id)
             assert row is not None
+            # Measured against each member's *own* anchor, so the five records a
+            # grouped box produces do not all report the anchor row's offsets.
+            anchor = row.anchor
             out.append(
                 replace(
                     m,
                     row_id=member_id,
-                    member_row_ids=list(members),
+                    member_row_ids=list(c.members),
                     label=row.text_1 or row.text_2,
                     context=row_context(row),
-                    match_distance=dist if member_id == row_id else _distance(m.bbox, row.anchor),
+                    match_distance=(
+                        c.distance if member_id == c.row_id else _distance(m.bbox, anchor)
+                    ),
+                    placement=c.placement,
+                    wrap_lines=c.wrap_lines,
+                    dx_from_text=m.bbox.x0 - anchor.x1,
+                    dy_from_text=m.bbox.y0 - anchor.y0,
                 )
             )
+    return out
+
+
+def attach_page_frame(
+    mappings: list[RecoveredMapping], rows: RowSet
+) -> list[RecoveredMapping]:
+    """Fill in the page frame each mark's absolute position is measured against.
+
+    ``page_width``/``page_height`` are normally already set by
+    :func:`read_marks`; this backfills them for a mapping built some other way,
+    and is the only place a mapping learns its page's ``gutter_x``.
+
+    ``dx_from_gutter`` is the one *page-level* landmark that means the same thing
+    across documents. The gutter is where this convention puts annotations, so a
+    small positive offset is a mark in the corridor where it belongs, and a large
+    negative one is a mark sitting inside the question column -- which is a
+    layout problem visible in a column of numbers rather than only by opening the
+    PDF. A single-column page has no gutter and gets ``None``: absence, not zero,
+    since zero would read as "exactly on the gutter".
+
+    Runs before matching, so an unmatched mark -- which by definition gets no
+    row-relative offsets -- still comes out with a position on the page.
+    """
+    out: list[RecoveredMapping] = []
+    for m in mappings:
+        page = rows.page(m.page_index)
+        if page is None:
+            out.append(m)
+            continue
+        out.append(
+            replace(
+                m,
+                page_width=m.page_width or page.width,
+                page_height=m.page_height or page.height,
+                dx_from_gutter=(
+                    m.bbox.x0 - page.gutter_x if page.gutter_x is not None else None
+                ),
+            )
+        )
     return out
 
 
@@ -857,6 +1160,8 @@ def summarize_page_domains(
             domain=domain,
             synthesized=True,
             legend_name=legend_by_page.get(page_index, {}).get(domain),
+            page_width=rep.page_width,
+            page_height=rep.page_height,
         )
         for (page_index, domain), rep in sorted(representative.items())
     ]
@@ -901,6 +1206,7 @@ def parse_annotated_pdf(
     legend_colors = legend_color_map(marks, rows)
     legend_by_page, marks = split_legend_marks(marks, rows)
     mappings = [_mark_to_mapping(m) for m in marks]
+    mappings = attach_page_frame(mappings, rows)
     mappings = attribute_domains(mappings, precedent, legend_colors)
     mappings = match_marks_to_rows(mappings, rows, max_match_distance)
     mappings = summarize_page_domains(mappings, legend_by_page)
@@ -911,9 +1217,143 @@ def parse_annotated_pdf(
 # Reference-table export
 # --------------------------------------------------------------------------
 
+def _num(value: Optional[float], places: int = 1) -> object:
+    """A float as a CSV cell, or an empty cell when it was never established.
+
+    Empty rather than 0, throughout: every number added here has a meaningful
+    zero -- ``dy_from_text = 0.0`` is "on the row's own baseline" and
+    ``dx_from_gutter = 0.0`` is "exactly on the gutter" -- so filling an unknown
+    with 0 would assert the most interesting value there is.
+    """
+    return "" if value is None else round(value, places)
+
+
+def _hex(color: Optional[tuple[float, float, float]]) -> str:
+    """A 0..1 RGB triple as ``#RRGGBB``.
+
+    Quantised the same way :func:`_color_key` quantises a fill, so a colour
+    written as ``0.75 1 1`` and read back as ``0.7490196`` renders as one hex
+    value and not as two nearly-identical ones a reviewer has to eyeball.
+    """
+    if color is None:
+        return ""
+    return "#" + "".join(f"{int(round(c * 255)):02X}" for c in color)
+
+
+#: Where the mark is, in both frames. See :func:`_position_cells` for why both.
+POSITION_COLUMNS = [
+    "x0", "y0", "x1", "y1", "mark_width", "mark_height", "page_width", "page_height",
+    "placement", "wrap_lines", "dx_from_text", "dy_from_text", "dx_from_gutter",
+]
+
+#: How the mark is drawn. See :class:`MarkStyle` for what each is for.
+STYLE_COLUMNS = [
+    "fill_hex", "text_hex", "font", "font_size", "bold", "italic",
+    "border_width", "border_style", "border_hex", "opacity", "rotation",
+    "printable", "hidden", "rich_text", "subtype", "author", "subject", "modified",
+]
+
+
+def _position_cells(m: RecoveredMapping) -> dict:
+    """Both position frames, because they answer different questions.
+
+    **Absolute** (``x0..y1`` in PDF user space, y up, with the page size beside
+    it so the numbers can be interpreted) is what you need to find the mark again
+    in a viewer, to check it against a margin, or to redraw it. It is
+    document-specific by construction: nothing about ``x0 = 512`` transfers to
+    another study whose pages, forms and question lengths differ.
+
+    **Relative to the text** is what generalises, and it is the answer to "where
+    do annotations go". ``layout.place_row`` puts a mark at ``anchor.x1 + GAP``
+    on the row's own baseline, so for anything this pipeline placed these are the
+    same two numbers on every page of every study, whatever the page size. A
+    third-party aCRF's own numbers are then directly comparable against them, and
+    a mark that drifts is a number out of line rather than something you have to
+    open the PDF to see. ``placement`` and ``wrap_lines`` say the same thing
+    categorically: which of ``layout``'s placements the mark was recognised as.
+
+    **These are measured on the rect the PDF stores, not on the rect that was
+    asked for**, and for a bordered mark those differ by
+    ``layout.BORDER_INFLATION`` per edge (see ``render.py``). So this pipeline's
+    own MSG output -- bordered on every annotation -- reads back as
+    ``dx_from_text = GAP - 0.5 = 3.5`` and ``dy_from_text = -0.5``, not 4.0 and
+    0.0. That is the honest number: it is where the annotation's rectangle
+    actually is. Compare against ``GAP - BORDER_INFLATION`` rather than against
+    ``GAP``, and expect an unbordered legacy mark to land on ``GAP`` exactly.
+
+    Neither frame substitutes for the other, which is why this exports both
+    rather than picking. The absolute rect cannot be compared across documents,
+    and the offsets cannot locate anything without one.
+    """
+    frame = {"page_width": _num(m.page_width), "page_height": _num(m.page_height)}
+    if m.synthesized:
+        # A derived page-domain row (summarize_page_domains) was never drawn. It
+        # borrows a representative mark's bbox so the record has geometry at all,
+        # and reporting that borrowed rect here would read as this row's own
+        # position. The page frame is still a fact about the page.
+        return {**{c: "" for c in POSITION_COLUMNS}, **frame}
+    return {
+        "x0": _num(m.bbox.x0),
+        "y0": _num(m.bbox.y0),
+        "x1": _num(m.bbox.x1),
+        "y1": _num(m.bbox.y1),
+        "mark_width": _num(m.bbox.width),
+        "mark_height": _num(m.bbox.height),
+        **frame,
+        "placement": m.placement or "",
+        "wrap_lines": "" if m.wrap_lines is None else m.wrap_lines,
+        "dx_from_text": _num(m.dx_from_text),
+        "dy_from_text": _num(m.dy_from_text),
+        "dx_from_gutter": _num(m.dx_from_gutter),
+    }
+
+
+def _style_cells(m: RecoveredMapping) -> dict:
+    """The presentation attributes, flattened for CSV -- see :class:`MarkStyle`.
+
+    ``fill_hex`` comes from the mapping's own ``fill`` rather than from the style
+    record: the fill is load-bearing (it is what the legend-colour attribution
+    tier keys on, see :func:`legend_color_map`) and so is modelled once, on the
+    the mapping, not duplicated into a second place that could drift from it.
+
+    A synthesized page-domain row gets blanks: nothing was drawn for it, and
+    ``MarkStyle``'s defaults would otherwise report a 1.0-opacity, printable,
+    unbordered FreeText that does not exist.
+    """
+    if m.synthesized:
+        return {c: "" for c in STYLE_COLUMNS}
+    s = m.style
+    return {
+        "fill_hex": _hex(m.fill),
+        "text_hex": _hex(s.text_color),
+        "font": s.font or "",
+        "font_size": _num(s.font_size, 2),
+        "bold": s.bold,
+        "italic": s.italic,
+        "border_width": _num(s.border_width, 2),
+        "border_style": s.border_style,
+        "border_hex": _hex(s.border_color),
+        "opacity": _num(s.opacity, 2),
+        "rotation": s.rotation,
+        "printable": s.printable,
+        "hidden": s.hidden,
+        "rich_text": s.rich_text,
+        "subtype": s.subtype,
+        "author": s.author,
+        "subject": s.subject,
+        "modified": s.modified,
+    }
+
+
+#: The narrow reference table. Carries the *relative* placement columns only:
+#: this is precedent meant to be reused when annotating a different CRF, where
+#: "the mark went 4pt past the question text on its own baseline" transfers and
+#: "the mark was at x=512 on a 612pt page" does not. The full absolute rect and
+#: the styling live in the report (``REPORT_COLUMNS``), which is the audit view.
 LOOKUP_COLUMNS = [
     "page", "label", "context", "domain", "variable", "condition", "fixed_value",
-    "domain_inferred", "match_distance", "text",
+    "domain_inferred", "match_distance", "placement", "dx_from_text", "dy_from_text",
+    "text",
 ]
 
 
@@ -940,7 +1380,10 @@ def to_lookup_rows(mappings: list[RecoveredMapping]) -> list[dict]:
                 "condition": m.condition or "",
                 "fixed_value": m.fixed_value or "",
                 "domain_inferred": m.domain_inferred,
-                "match_distance": round(m.match_distance, 1) if m.match_distance is not None else "",
+                "match_distance": _num(m.match_distance),
+                "placement": m.placement or "",
+                "dx_from_text": _num(m.dx_from_text),
+                "dy_from_text": _num(m.dy_from_text),
                 "text": m.text,
             }
         )
@@ -966,7 +1409,7 @@ REPORT_COLUMNS = [
     "page", "kind", "text", "domain", "variable", "condition", "fixed_value",
     "domain_inferred", "domain_inference_source", "row_id", "label", "context",
     "match_distance", "synthesized", "legend_name",
-]
+] + POSITION_COLUMNS + STYLE_COLUMNS
 
 
 def to_report_rows(mappings: list[RecoveredMapping]) -> list[dict]:
@@ -978,6 +1421,12 @@ def to_report_rows(mappings: list[RecoveredMapping]) -> list[dict]:
     ``max_match_distance`` all get a row, with ``row_id`` blank wherever a
     match failed. That blank is the signal to look at: a page-by-page count
     of it is the actual answer to "how much of this resolved cleanly".
+
+    It is also where the geometry (``POSITION_COLUMNS``) and the styling
+    (``STYLE_COLUMNS``) come out, and they belong on *this* export rather than
+    the lookup table for the same reason everything else here does: both are
+    facts about a particular drawn mark in a particular document, which is what
+    an audit view is for and what reusable precedent is not.
     """
     rows = []
     for m in mappings:
@@ -995,9 +1444,11 @@ def to_report_rows(mappings: list[RecoveredMapping]) -> list[dict]:
                 "row_id": m.row_id or "",
                 "label": m.label or "",
                 "context": m.context or "",
-                "match_distance": round(m.match_distance, 1) if m.match_distance is not None else "",
+                "match_distance": _num(m.match_distance),
                 "synthesized": m.synthesized,
                 "legend_name": m.legend_name or "",
+                **_position_cells(m),
+                **_style_cells(m),
             }
         )
     return rows
@@ -1019,9 +1470,13 @@ __all__ = [
     "DEFAULT_MAX_MATCH_DISTANCE",
     "LOOKUP_COLUMNS",
     "NOT_SUBMITTED_TEXT",
+    "POSITION_COLUMNS",
     "REPORT_COLUMNS",
+    "STYLE_COLUMNS",
+    "MarkStyle",
     "RawMark",
     "RecoveredMapping",
+    "attach_page_frame",
     "attribute_domains",
     "classify_mark",
     "legend_color_map",

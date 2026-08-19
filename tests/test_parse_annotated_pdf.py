@@ -18,6 +18,9 @@ from pipeline import layout, xfdf
 from pipeline.rows import extract_rows
 from pipeline.models import NOT_SUBMITTED_TEXT, AnnotationSet, BBox, PageGeometry
 from pipeline.parse_annotated_pdf import (
+    POSITION_COLUMNS,
+    REPORT_COLUMNS,
+    STYLE_COLUMNS,
     RawMark,
     RecoveredMapping,
     attribute_domains,
@@ -703,3 +706,128 @@ def test_report_csv_has_a_row_for_every_recovered_mark(crfs, annotated_pdf, tmp_
     non_summary = [r for r in rows if r["synthesized"] != "True"]
     assert non_summary, "fixture should contain at least one non-summary row"
     assert all(r["row_id"] for r in non_summary)
+
+
+# --- position and styling, recorded rather than interpreted -------------------
+
+
+@pytest.fixture
+def styled_pdf(tmp_path):
+    """One page carrying every styling shape this module has to read back.
+
+    Includes a mark whose print flag is cleared and one whose /DA states its
+    colour in grayscale rather than RGB -- neither is something this pipeline
+    writes, and both are things a third-party aCRF does.
+    """
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    draw_annotation(page, BBox(x0=50, y0=700, x1=140, y1=712), "MAPPED", fill=(191, 255, 255))
+    draw_annotation(page, BBox(x0=50, y0=650, x1=140, y1=662), "a comment", dashed=True)
+    gray = draw_annotation(page, BBox(x0=50, y0=600, x1=140, y1=612), "GRAYNOTE")
+    doc.xref_set_key(gray.xref, "DA", "(0.5 g /Helv 7 Tf)")
+    unprinted = draw_annotation(page, BBox(x0=50, y0=550, x1=140, y1=562), "INVISIBLE", fill=(191, 255, 255))
+    unprinted.set_flags(0)
+    unprinted.update()
+
+    out = tmp_path / "styled.pdf"
+    save_with_annotations(doc, out)
+    doc.close()
+    return out
+
+
+def _by_text(marks):
+    return {m.text: m for m in marks}
+
+
+def test_styling_is_recovered_from_the_annotation_layer(styled_pdf):
+    """Font, size, colours and border style all come back off a drawn annotation."""
+    marks = _by_text(read_marks(styled_pdf))
+
+    mapped = marks["MAPPED"].style
+    assert (mapped.font, mapped.font_size) == ("Helv", layout.FONT_SIZE)
+    assert mapped.text_color == (0.0, 0.0, 0.0)  # MSG: black text on the fill
+    assert (mapped.border_style, mapped.border_width) == ("solid", 1.0)
+    assert not mapped.bold and not mapped.italic
+    assert (mapped.opacity, mapped.rotation, mapped.subtype) == (1.0, 0, "FreeText")
+    # The searchability MSG depends on: text in /Contents, not a rich-text stream.
+    assert not mapped.rich_text
+
+    # MSG's only mapping-versus-comment distinction is the border style.
+    assert marks["a comment"].style.border_style == "dashed"
+    assert marks["GRAYNOTE"].style.border_style == "none"
+
+
+def test_a_grayscale_da_states_a_colour_like_an_rgb_one(styled_pdf):
+    """``0.5 g`` is a colour, not an absence of one -- and so still reads as a note.
+
+    A third-party aCRF is under no obligation to have written its /DA in RGB,
+    and a note whose grey went unread would classify as a mapping.
+    """
+    gray = _by_text(read_marks(styled_pdf))["GRAYNOTE"]
+    assert gray.style.text_color == (0.5, 0.5, 0.5)
+    assert gray.muted
+
+
+def test_a_mark_that_does_not_print_is_reported_as_such(styled_pdf):
+    """An annotation with the print flag clear is absent from the submitted document.
+
+    It looks correct in a viewer, which is exactly why it has to be a column
+    rather than something a reviewer is expected to notice.
+    """
+    marks = _by_text(read_marks(styled_pdf))
+    assert marks["INVISIBLE"].style.printable is False
+    assert marks["MAPPED"].style.printable is True
+
+
+def test_offsets_invert_place_row_for_this_pipelines_own_output(crfs, annotated_pdf):
+    """Every recovered mark reports the placement ``layout.place_row`` gave it.
+
+    The point of the relative columns: whatever the study, the page size or the
+    question's length, a mark this pipeline drew sits ``GAP`` past the question
+    text on its own baseline. The half-border inflation of the stored /Rect is
+    what makes those numbers 3.5 and -0.5 rather than 4.0 and 0.0 -- see
+    ``_position_cells``; it is measured on the rect the PDF actually holds.
+    """
+    final, _placed = annotated_pdf
+    mappings = parse_annotated_pdf(final, crfs["acroform"])
+    matched = [m for m in mappings if m.row_id is not None]
+    assert matched
+
+    assert {m.placement for m in matched} <= {"slot1", "slot2", "wrap", "group"}
+    slot1 = [m for m in matched if m.placement == "slot1"]
+    assert slot1
+    for m in slot1:
+        assert m.dx_from_text == pytest.approx(layout.GAP - layout.BORDER_INFLATION, abs=0.05)
+        assert m.dy_from_text == pytest.approx(-layout.BORDER_INFLATION, abs=0.05)
+        assert m.wrap_lines == 0
+
+
+def test_page_frame_is_attached_to_matched_and_unmatched_marks_alike(crfs, annotated_pdf):
+    """An unmatched mark has no row to measure against but is still *somewhere*."""
+    final, _placed = annotated_pdf
+    mappings = parse_annotated_pdf(final, crfs["acroform"])
+    real = [m for m in mappings if not m.synthesized]
+    assert real
+    for m in real:
+        assert (m.page_width, m.page_height) == (612.0, 792.0)
+
+
+def test_a_synthesized_page_domain_row_claims_no_position_or_styling(crfs, annotated_pdf):
+    """It borrows a representative mark's bbox; reporting that would be a fabrication."""
+    final, _placed = annotated_pdf
+    rows = to_report_rows(parse_annotated_pdf(final, crfs["acroform"]))
+    derived = [r for r in rows if r["synthesized"]]
+    assert derived
+    for row in derived:
+        assert all(row[c] == "" for c in STYLE_COLUMNS)
+        assert all(row[c] == "" for c in POSITION_COLUMNS if not c.startswith("page_"))
+        assert row["page_width"] == 612.0  # the page frame is still a fact
+
+
+def test_report_rows_carry_exactly_the_declared_columns(crfs, annotated_pdf):
+    """A column added to one of the three lists and not the other is a silent hole."""
+    final, _placed = annotated_pdf
+    rows = to_report_rows(parse_annotated_pdf(final, crfs["acroform"]))
+    assert rows
+    for row in rows:
+        assert list(row) == REPORT_COLUMNS

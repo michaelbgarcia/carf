@@ -13,7 +13,11 @@ Usage:
     python scripts/parse_annotated_crf.py <annotated.pdf> [--blank blank.pdf] [-o report.csv]
 
 ``-o`` writes the full diagnostic report -- every mark found, matched or not,
-one row each; the thing to open and skim to see what actually happened.
+one row each; the thing to open and skim to see what actually happened. It
+carries each mark's position (absolute rect, plus its offset from the row it
+annotates) and its styling (font, size, colours, border, print flags), which is
+what a Metadata Submission Guidelines QC pass needs and what tells you where to
+put an annotation on the next CRF.
 ``--lookup-out`` writes the narrower reference table instead: matched
 variable-kind mappings only, keyed by label, meant for reuse as Copilot-
 prompt precedent rather than for review.
@@ -106,6 +110,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"domain inferred (not stated on the mark itself): {len(inferred)}")
         for source, count in sorted(by_source.items()):
             print(f"  via {source}: {count}")
+    placements: dict[str, int] = {}
+    for m in matched:
+        placements[m.placement or "unknown"] = placements.get(m.placement or "unknown", 0) + 1
+    if placements:
+        # "nearest" is the fallback tier: no reconstructed placement, just the
+        # closest row. A corpus that is mostly "nearest" is a corpus whose
+        # annotations were not placed by this convention, and every one of those
+        # matches is a guess -- which is worth seeing before the row counts are
+        # taken at face value.
+        print("placement (how the match was recognised):")
+        for placement, count in sorted(placements.items(), key=lambda kv: -kv[1]):
+            print(f"  {placement}: {count}")
+
     if unmatched:
         print("\nunmatched marks:")
         for m in unmatched:
